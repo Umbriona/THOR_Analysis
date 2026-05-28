@@ -1,3 +1,22 @@
-## Directories to ignore
+# macOS
+.DS_Store
 
+# Python
+__pycache__/
+
+# Jupyter
+.ipynp_checkpoints/
+
+# Local environments
+.venv/
+venv/
+.env
+
+# Data
 /Data
+
+# Generated Results
+/Results/
+
+# Common log
+*.log
