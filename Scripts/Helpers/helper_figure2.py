@@ -1,4 +1,15 @@
+import seaborn as sns
+import matplotlib.pyplot as plt
+import os
+import numpy as np
+from pathlib import Path
+from Bio import SeqIO
+from glob import glob
+from scipy.optimize import curve_fit
+import pandas as pd
 
+import sklearn
+from scipy.stats import pearsonr, spearmanr
 
 ####################################################################################
 ##                         Thermal Shift Assay helpers                            ##  
@@ -252,22 +263,15 @@ def well_index_sort_key(well_index):
     return row_label, int(column_label) if column_label else -1
 
 
-def load_tsa_curve(curve_dir, well_index):
-    from pathlib import Path
-
-    curve_path = Path(curve_dir) / f"{well_index}.txt"
-    data_rows = []
-
-    for line in curve_path.read_text().splitlines():
-        if not line:
-            continue
-        if not line.startswith("#"):
-            data_rows.append(line.split("\t"))
-
-    curve_df = pd.DataFrame(data_rows, columns=["temperature_c", "absorbance"])
+def _normalize_tsa_curve_df(curve_df):
+    curve_df = curve_df.copy()
     curve_df["temperature_c"] = pd.to_numeric(curve_df["temperature_c"], errors="coerce")
     curve_df["absorbance"] = pd.to_numeric(curve_df["absorbance"], errors="coerce")
     curve_df = curve_df.dropna(how="any").sort_values("temperature_c").reset_index(drop=True)
+
+    if curve_df.empty:
+        curve_df["normalized_absorbance"] = pd.Series(dtype=float)
+        return curve_df
 
     peak_index = curve_df["absorbance"].idxmax()
     pre_peak_df = curve_df.loc[:peak_index].copy()
@@ -280,6 +284,41 @@ def load_tsa_curve(curve_dir, well_index):
         curve_df["normalized_absorbance"] = (
             (curve_df["absorbance"] - norm_min) / (norm_max - norm_min)
         ).clip(0, 1)
+
+    return curve_df.reset_index(drop=True)
+
+
+def _read_tsa_curve_file(curve_path):
+    curve_path = Path(curve_path)
+    header_values = {}
+    data_rows = []
+
+    for line in curve_path.read_text().splitlines():
+        if not line:
+            continue
+        if line.startswith("#"):
+            if ":" in line:
+                key, value = line[1:].split(":", 1)
+                header_values[key.strip()] = value.strip()
+            continue
+        data_rows.append(line.split("\t"))
+
+    curve_df = pd.DataFrame(data_rows, columns=["temperature_c", "absorbance"])
+    curve_df = _normalize_tsa_curve_df(curve_df)
+
+    return curve_df, header_values
+
+
+def load_tsa_curve(curve_dir, well_index):
+    curve_path = Path(curve_dir) / f"{well_index}.txt"
+    curve_df, _ = _read_tsa_curve_file(curve_path)
+    return curve_df.reset_index(drop=True)
+
+
+def load_tsa_curve_file(curve_path):
+    curve_df, header_values = _read_tsa_curve_file(curve_path)
+    curve_df["Tm"] = pd.to_numeric(header_values.get("Fitted Tm"), errors="coerce")
+    curve_df["R_square"] = pd.to_numeric(header_values.get("R square"), errors="coerce")
 
     return curve_df.reset_index(drop=True)
 
@@ -473,6 +512,346 @@ def plot_best_variant_curves(curve_data, best_variants, replicate_to_plot=1, siz
         )
 
         ax.legend(handles=legend_handles, frameon=False, ncol=1, loc="best")
+        plt.tight_layout(pad=0.4)
+
+    return ax
+
+
+def prepare_tsa_curve_data_from_directory(curve_dir, tm_summary_df=None):
+    curve_dir = Path(curve_dir)
+    curve_paths = sorted(
+        path for path in curve_dir.glob("*.txt")
+        if "_rep" in path.stem and path.stem.rsplit("_rep", 1)[-1].isdigit()
+    )
+
+    if not curve_paths:
+        raise ValueError(
+            f"No replicate TSA curve files matching '*_repN.txt' were found in {curve_dir}"
+        )
+
+    curve_frames = []
+    replicate_rows = []
+
+    for curve_path in curve_paths:
+        sample_name, replicate_label = curve_path.stem.rsplit("_rep", 1)
+        replicate_id = int(replicate_label)
+        wildtype_id = sample_name.split("_", 1)[0]
+        sample_type = "Wildtype" if sample_name == wildtype_id else "Best variant"
+
+        curve_df = load_tsa_curve_file(curve_path)
+        curve_tm = pd.to_numeric(curve_df["Tm"], errors="coerce").dropna()
+        curve_r_square = pd.to_numeric(curve_df["R_square"], errors="coerce").dropna()
+
+        curve_df["wildtype_id"] = wildtype_id
+        curve_df["variant_name"] = sample_name if sample_type == "Best variant" else np.nan
+        curve_df["sample_name"] = sample_name
+        curve_df["sample_type"] = sample_type
+        curve_df["replicate_id"] = replicate_id
+        curve_df["curve_file"] = curve_path.name
+        curve_frames.append(curve_df)
+
+        replicate_rows.append(
+            {
+                "wildtype_id": wildtype_id,
+                "variant_name": sample_name if sample_type == "Best variant" else np.nan,
+                "sample_name": sample_name,
+                "sample_type": sample_type,
+                "replicate_id": replicate_id,
+                "curve_file": curve_path.name,
+                "Tm": float(curve_tm.iloc[0]) if not curve_tm.empty else np.nan,
+                "R_square": float(curve_r_square.iloc[0]) if not curve_r_square.empty else np.nan
+            }
+        )
+
+    curve_data = pd.concat(curve_frames, ignore_index=True)
+    replicate_summary = pd.DataFrame(replicate_rows)
+
+    sample_type_order = {"Wildtype": 0, "Best variant": 1}
+    replicate_summary["sample_type_order"] = (
+        replicate_summary["sample_type"].map(sample_type_order).fillna(99).astype(int)
+    )
+    replicate_summary = (
+        replicate_summary.sort_values(
+            ["wildtype_id", "sample_type_order", "sample_name", "replicate_id"]
+        )
+        .drop(columns=["sample_type_order"])
+        .reset_index(drop=True)
+    )
+
+    sample_summary = (
+        replicate_summary.groupby(["wildtype_id", "sample_name", "sample_type"], as_index=False)
+        .agg(
+            curve_replicates=("replicate_id", "nunique"),
+            curve_mean_Tm=("Tm", "mean"),
+            curve_median_Tm=("Tm", "median"),
+            curve_min_Tm=("Tm", "min"),
+            curve_max_Tm=("Tm", "max")
+        )
+    )
+
+    wildtype_summary = sample_summary.loc[sample_summary["sample_type"] == "Wildtype"].copy()
+    variant_summary = sample_summary.loc[sample_summary["sample_type"] == "Best variant"].copy()
+
+    if wildtype_summary.empty or variant_summary.empty:
+        raise ValueError(
+            "Expected both wildtype and variant replicate files in the curve directory."
+        )
+
+    wildtype_summary = wildtype_summary.rename(
+        columns={
+            "sample_name": "wildtype_name",
+            "curve_replicates": "wildtype_curve_replicates",
+            "curve_mean_Tm": "wildtype_curve_mean_Tm",
+            "curve_median_Tm": "wildtype_curve_median_Tm",
+            "curve_min_Tm": "wildtype_curve_min_Tm",
+            "curve_max_Tm": "wildtype_curve_max_Tm"
+        }
+    )
+    variant_summary = variant_summary.rename(
+        columns={
+            "sample_name": "variant_name",
+            "curve_replicates": "variant_curve_replicates",
+            "curve_mean_Tm": "variant_curve_mean_Tm",
+            "curve_median_Tm": "variant_curve_median_Tm",
+            "curve_min_Tm": "variant_curve_min_Tm",
+            "curve_max_Tm": "variant_curve_max_Tm"
+        }
+    )
+
+    curve_pairs = variant_summary.merge(
+        wildtype_summary[
+            [
+                "wildtype_id",
+                "wildtype_name",
+                "wildtype_curve_replicates",
+                "wildtype_curve_mean_Tm",
+                "wildtype_curve_median_Tm",
+                "wildtype_curve_min_Tm",
+                "wildtype_curve_max_Tm"
+            ]
+        ],
+        on="wildtype_id",
+        how="left"
+    )
+
+    missing_wildtypes = curve_pairs.loc[curve_pairs["wildtype_name"].isna(), "wildtype_id"].tolist()
+    if missing_wildtypes:
+        raise ValueError(
+            "Missing matching wildtype replicate files for: "
+            + ", ".join(sorted(set(missing_wildtypes)))
+        )
+
+    if tm_summary_df is not None:
+        _, tm_variant_summary = summarize_tm_shifts(tm_summary_df[["#Annotation", "#Tm"]])
+        curve_pairs = curve_pairs.merge(
+            tm_variant_summary[
+                [
+                    "wildtype_id",
+                    "variant_name",
+                    "variant_mean_Tm",
+                    "wildtype_mean_Tm",
+                    "Tm_difference_vs_wildtype",
+                    "n_replicates"
+                ]
+            ],
+            on=["wildtype_id", "variant_name"],
+            how="left"
+        )
+    else:
+        curve_pairs["variant_mean_Tm"] = curve_pairs["variant_curve_mean_Tm"]
+        curve_pairs["wildtype_mean_Tm"] = curve_pairs["wildtype_curve_mean_Tm"]
+        curve_pairs["Tm_difference_vs_wildtype"] = (
+            curve_pairs["variant_mean_Tm"] - curve_pairs["wildtype_mean_Tm"]
+        )
+        curve_pairs["n_replicates"] = curve_pairs["variant_curve_replicates"]
+
+    curve_pairs = curve_pairs.sort_values(["wildtype_id", "variant_name"]).reset_index(drop=True)
+
+    return curve_pairs, replicate_summary, curve_data
+
+
+def plot_tsa_replicate_bands(
+    curve_data,
+    curve_pairs=None,
+    size_mm=(120, 60),
+    font_size=5.5,
+    order=None,
+    title=None,
+    show_tm_markers=True
+):
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+
+    if order is None:
+        if curve_pairs is not None and not curve_pairs.empty:
+            order = curve_pairs["wildtype_id"].drop_duplicates().tolist()
+        else:
+            order = curve_data["wildtype_id"].dropna().drop_duplicates().tolist()
+
+    rc_params = {
+        "font.size": font_size,
+        "axes.titlesize": font_size,
+        "axes.labelsize": font_size,
+        "xtick.labelsize": font_size,
+        "ytick.labelsize": font_size,
+        "legend.fontsize": font_size,
+        "legend.title_fontsize": font_size
+    }
+    wildtype_palette = {
+        "MGYP001421927114": "#6ACC64",
+        "A0A2S1LEZ1": "#EE854A",
+        "A0A372IUB3": "#4878D0"
+    }
+    line_styles = {"Wildtype": "-", "Best variant": "--"}
+    band_alphas = {"Wildtype": 0.12, "Best variant": 0.22}
+    wildtype_order = {wildtype_id: index for index, wildtype_id in enumerate(order)}
+
+    sample_summary = (
+        curve_data[["wildtype_id", "sample_name", "sample_type"]]
+        .drop_duplicates()
+        .assign(
+            wildtype_order=lambda x: x["wildtype_id"].map(wildtype_order).fillna(len(order)),
+            sample_type_order=lambda x: x["sample_type"].map({"Wildtype": 0, "Best variant": 1}).fillna(99)
+        )
+        .sort_values(["wildtype_order", "sample_type_order", "sample_name"])
+        .reset_index(drop=True)
+    )
+    sample_tm_summary = (
+        curve_data[["wildtype_id", "sample_name", "sample_type", "replicate_id", "Tm"]]
+        .dropna(subset=["Tm"])
+        .drop_duplicates(["wildtype_id", "sample_name", "sample_type", "replicate_id"])
+        .groupby(["wildtype_id", "sample_name", "sample_type"], as_index=False)
+        .agg(median_Tm=("Tm", "median"))
+    )
+    sample_summary = sample_summary.merge(
+        sample_tm_summary,
+        on=["wildtype_id", "sample_name", "sample_type"],
+        how="left"
+    )
+
+    with plt.rc_context(rc_params):
+        fig, ax = plt.subplots(figsize=(mm_to_inches(size_mm[0]), mm_to_inches(size_mm[1])))
+
+        for _, sample_row in sample_summary.iterrows():
+            subset = curve_data.loc[
+                (curve_data["wildtype_id"] == sample_row["wildtype_id"])
+                & (curve_data["sample_name"] == sample_row["sample_name"])
+            ]
+            if subset.empty:
+                continue
+
+            curve_band = (
+                subset.groupby("temperature_c", as_index=False)
+                .agg(
+                    min_absorbance=("normalized_absorbance", "min"),
+                    median_absorbance=("normalized_absorbance", "median"),
+                    max_absorbance=("normalized_absorbance", "max")
+                )
+                .sort_values("temperature_c")
+            )
+
+            color = wildtype_palette.get(sample_row["wildtype_id"], "#666666")
+            sample_type = sample_row["sample_type"]
+
+            ax.fill_between(
+                curve_band["temperature_c"],
+                curve_band["min_absorbance"],
+                curve_band["max_absorbance"],
+                color=color,
+                alpha=band_alphas.get(sample_type, 0.18),
+                linewidth=0
+            )
+            ax.plot(
+                curve_band["temperature_c"],
+                curve_band["median_absorbance"],
+                color=color,
+                linestyle=line_styles.get(sample_type, "-"),
+                linewidth=1.1,
+                alpha=0.98
+            )
+
+            if show_tm_markers and pd.notna(sample_row["median_Tm"]):
+                tm_curve_y = float(
+                    np.interp(
+                        float(sample_row["median_Tm"]),
+                        curve_band["temperature_c"].to_numpy(dtype=float),
+                        curve_band["median_absorbance"].to_numpy(dtype=float)
+                    )
+                )
+                ax.scatter(
+                    [sample_row["median_Tm"]],
+                    [tm_curve_y],
+                    color=color,
+                    s=18,
+                    edgecolors="white",
+                    linewidths=0.35,
+                    alpha=1.0,
+                    zorder=4
+                )
+
+        ax.set_xlabel("Temperature (°C)")
+        ax.set_ylabel("Normalized absorbance")
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_xticks([30, 40, 50, 60, 70, 80, 90, 100])
+        ax.tick_params(axis="x", length=2, width=0.5)
+        ax.tick_params(axis="y", length=2, width=0.5)
+        if title is not None:
+            ax.set_title(title)
+
+        legend_handles = []
+        for wildtype_id in order:
+            wildtype_subset = sample_summary.loc[
+                (sample_summary["wildtype_id"] == wildtype_id)
+                & (sample_summary["sample_type"] == "Wildtype")
+            ]
+            variant_subset = sample_summary.loc[
+                (sample_summary["wildtype_id"] == wildtype_id)
+                & (sample_summary["sample_type"] == "Best variant")
+            ]
+            color = wildtype_palette.get(wildtype_id, "#666666")
+
+            if not wildtype_subset.empty:
+                legend_handles.append(
+                    Line2D([0], [0], color=color, linestyle="-", linewidth=1.1, label=f"{wildtype_id} WT")
+                )
+            for _, variant_row in variant_subset.iterrows():
+                legend_handles.append(
+                    Line2D(
+                        [0],
+                        [0],
+                        color=color,
+                        linestyle="--",
+                        linewidth=1.1,
+                        label=variant_row["sample_name"]
+                    )
+                )
+
+        legend_handles.append(
+            Patch(facecolor="#666666", edgecolor="none", alpha=0.18, label="Replicate range")
+        )
+        if show_tm_markers:
+            legend_handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    color="#666666",
+                    marker="o",
+                    markerfacecolor="#666666",
+                    markeredgecolor="white",
+                    markeredgewidth=0.35,
+                    markersize=4,
+                    linewidth=0,
+                    label="Median Tm"
+                )
+            )
+        ax.legend(
+            handles=legend_handles,
+            frameon=False,
+            ncol=1,
+            loc="upper left",
+            #bbox_to_anchor=(1.02, 1),
+            borderaxespad=0
+        )
         plt.tight_layout(pad=0.4)
 
     return ax
