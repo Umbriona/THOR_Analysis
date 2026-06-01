@@ -1861,7 +1861,7 @@ def plot_rate_curves_by_temperature(
             ax.set_title(f"Batch 5 kinetics, {int(temperature)} °C" if float(temperature).is_integer() else f"Batch 5 kinetics, {temperature:g} °C")
             ax.set_xlim(0, x_max)
             ax.set_ylim(0, y_max)
-            ax.set_xlabel("OAA concentration (mM)")
+            ax.set_xlabel("Enzyme concentration (mM)")
             ax.set_ylabel(f"Rate ({rate_unit})")
             ax.grid(axis="y", alpha=0.25)
             ax.legend(frameon=False, ncol=2, loc="best")
