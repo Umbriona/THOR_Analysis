@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import re
 
+import pandas as pd
+
 
 _NUMBER_PATTERN = re.compile(r"(\d+)")
 
@@ -75,3 +77,64 @@ def merge_swissprot_annotations(
         pattern="part_*.emapper.annotations",
         output_name="SiwssProt.emapper.annotations",
     )
+
+
+
+####################################################################################
+########################### Computing Thermophilic COGs ############################
+####################################################################################
+
+def extract_COG(x, idx):
+    if x == "-":
+        return x
+    list_COGs = x.split(",")
+    if len(list_COGs) < idx+1:
+        return list_COGs[-1].split("@")[0]
+        
+    COG = list_COGs[idx].split("@")[0]
+    return COG
+
+ec_col = "EC"
+def calc_num_EC_tempRange(df, min_temp=60, key="Temperature_y"):
+    
+    df_tmp = df
+    ecs = (df_tmp[ec_col].dropna().astype(str).str.split(";").explode().str.strip())
+    ecs = ecs[ecs.ne("")]  # remove empty strings
+    ecs = ecs[ecs.str.match(r"^\d+(\.\d+|\.-){3}$", na=False)]
+    unique_ec4 = pd.Index(ecs.unique())
+    n_unique_ec4 = len(unique_ec4)
+
+    print("Unique full ECs (x1.x2.x3.x4):", n_unique_ec4)
+
+    df_tmp = df_tmp.loc[df_tmp[key]>=min_temp]
+    ecs = (df_tmp[ec_col].dropna().astype(str).str.split(";").explode().str.strip())
+    ecs = ecs[ecs.ne("")]  # remove empty strings
+    ecs = ecs[ecs.str.match(r"^\d+(\.\d+|\.-){3}$", na=False)]
+    unique_ec4_mintemp = pd.Index(ecs.unique())
+    n_unique_ec4_mintemp = len(unique_ec4_mintemp)
+
+    print(r"Unique full ECs with temperature above 60 $ \degree C$ (x1.x2.x3.x4):", n_unique_ec4_mintemp)
+    
+    print(fr"Fraction of ECs with sequence above 60 $ \degree C$: {n_unique_ec4_mintemp/n_unique_ec4:.2f}" )
+    return n_unique_ec4, n_unique_ec4_mintemp
+
+def calc_num_COG_tempRange(df, min_temp=60, key="Temperature_y", COG_col="root_COG"):
+    df_tmp = df
+    ecs = (df_tmp[COG_col].dropna())
+    ecs = ecs[ecs.ne("")]  # remove empty strings
+    
+    unique_COG = pd.Index(ecs.unique())
+    n_unique_COG = len(unique_COG)
+
+    print("Unique COGs:", n_unique_COG)
+
+    df_tmp = df_tmp.loc[df_tmp[key]>=min_temp]
+    ecs = (df_tmp[COG_col].dropna())
+    ecs = ecs[ecs.ne("")]  # remove empty strings
+    unique_COG_mintemp = pd.Index(ecs.unique())
+    n_unique_COG_mintemp = len(unique_COG_mintemp)
+
+    print(r"Unique full COGs with temperature above 60 $ \degree C$:", n_unique_COG_mintemp)
+    
+    print(fr"Fraction of COGs with sequence above 60 $ \degree C$: {n_unique_COG_mintemp/n_unique_COG:.2f}" )
+    return n_unique_COG, n_unique_COG_mintemp
