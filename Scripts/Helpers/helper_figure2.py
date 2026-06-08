@@ -4,12 +4,15 @@ import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 import glob
-import os, sys
+import os, sys, re
+
 import numpy as np
 import warnings
 warnings.filterwarnings('ignore')
+from collections import defaultdict, Counter
 
-from scipy.stats import chisquare
+from scipy.stats import fisher_exact, binomtest, chisquare
+from statsmodels.stats.multitest import multipletests
 import umap
 import pickle
 
@@ -114,6 +117,7 @@ def add_aa2dict(seq, df_aa):
 AAS = "ACDEFGHIKLMNPQRSTVWY"
 AA_SET = set(AAS)
 aa2int = {aa: i for i, aa in enumerate(AAS)}
+int2aa = {i: aa for aa, i in aa2int.items()}
 
 LOW_LABEL = "Uniprot Enzymes"   # mesophilic, <45 C
 HIGH_LABEL = "IMG Enzymes"      # thermophilic, >=60 C
@@ -123,7 +127,7 @@ HIGH_LABEL = "IMG Enzymes"      # thermophilic, >=60 C
 # Header parsing
 # ============================================================
 
-def get_group_from_description(description):
+def get_group_from_description_wt(description):
     parts = [x.strip() for x in description.split("|")]
     label = parts[-1]
     if label == LOW_LABEL:
@@ -133,7 +137,7 @@ def get_group_from_description(description):
     return None
 
 
-def get_organism_from_description(description):
+def get_organism_from_description_wt(description):
     """
     Tries to recover an organism identifier from the header.
 
@@ -154,7 +158,7 @@ def get_organism_from_description(description):
 # Consensus collapsing per organism, per alignment
 # ============================================================
 
-def consensus_sequence(seqs):
+def consensus_sequence_wt(seqs):
     """
     Most frequent non-gap, standard aa per column.
     If no standard aa is observed at a column, return '-'.
@@ -175,7 +179,7 @@ def consensus_sequence(seqs):
     return "".join(cons)
 
 
-def load_alignment_records(alignment_file, collapse_by_organism=True):
+def load_alignment_records_wt(alignment_file, collapse_by_organism=True):
     """
     Returns a list of dicts:
         {
@@ -190,12 +194,12 @@ def load_alignment_records(alignment_file, collapse_by_organism=True):
     """
     raw = []
     for rec in SeqIO.parse(alignment_file, "fasta"):
-        group = get_group_from_description(rec.description)
+        group = get_group_from_description_wt(rec.description)
         if group is None:
             continue
 
         seq = str(rec.seq)
-        organism = get_organism_from_description(rec.description)
+        organism = get_organism_from_description_wt(rec.description)
 
         raw.append({
             "group": group,
@@ -223,7 +227,7 @@ def load_alignment_records(alignment_file, collapse_by_organism=True):
         collapsed.append({
             "group": group,
             "organism": organism,
-            "seq": consensus_sequence(seqs)
+            "seq": consensus_sequence_wt(seqs)
         })
 
     return collapsed
@@ -233,7 +237,7 @@ def load_alignment_records(alignment_file, collapse_by_organism=True):
 # Per-position residue association testing
 # ============================================================
 
-def test_position_amino_acid(records, pos, aa):
+def test_position_amino_acid_wt(records, pos, aa):
     """
     2x2 Fisher exact test:
 
@@ -277,7 +281,7 @@ def test_position_amino_acid(records, pos, aa):
     return pval, oddsratio, (a, b, c, d)
 
 
-def find_temperature_associated_residues(
+def find_temperature_associated_residues_wt(
     records,
     correction="bonferroni",
     alpha=0.01,
@@ -305,7 +309,7 @@ def find_temperature_associated_residues(
 
     for pos in range(L):
         for aa in AAS:
-            pval, oddsratio, counts = test_position_amino_acid(records, pos, aa)
+            pval, oddsratio, counts = test_position_amino_acid_wt(records, pos, aa)
             a, b, c, d = counts
 
             tests.append({
@@ -358,7 +362,7 @@ def find_temperature_associated_residues(
 # Build Fig. 5B-like substitution matrix
 # ============================================================
 
-def count_standard_residues_at_pos(records, pos, group):
+def count_standard_residues_at_pos_wt(records, pos, group):
     counts = np.zeros(len(AAS), dtype=int)
     for r in records:
         if r["group"] != group:
@@ -369,7 +373,7 @@ def count_standard_residues_at_pos(records, pos, group):
     return counts
 
 
-def build_substitution_matrix_from_significant_positions(records, sig_low, sig_high):
+def build_substitution_matrix_from_significant_positions_wt(records, sig_low, sig_high):
     """
     Build a low-T -> high-T substitution matrix, using only positions where
     at least one low-associated residue and one high-associated residue were found.
@@ -390,8 +394,8 @@ def build_substitution_matrix_from_significant_positions(records, sig_low, sig_h
         if len(low_aas) == 0 or len(high_aas) == 0:
             continue
 
-        low_counts = count_standard_residues_at_pos(records, pos, "low")
-        high_counts = count_standard_residues_at_pos(records, pos, "high")
+        low_counts = count_standard_residues_at_pos_wt(records, pos, "low")
+        high_counts = count_standard_residues_at_pos_wt(records, pos, "high")
 
         low_total = low_counts.sum()
         high_total = high_counts.sum()
@@ -438,31 +442,31 @@ def build_substitution_matrix_from_significant_positions(records, sig_low, sig_h
 # Across many alignments
 # ============================================================
 
-def analyze_alignment_paper_like(
+def analyze_alignment_paper_like_wt(
     alignment_file,
     collapse_by_organism=True,
     correction="bonferroni",
     alpha=0.01,
     min_group_size=5
 ):
-    records = load_alignment_records(alignment_file, collapse_by_organism=collapse_by_organism)
+    records = load_alignment_records_wt(alignment_file, collapse_by_organism=collapse_by_organism)
     if len(records) == 0:
         return np.zeros((len(AAS), len(AAS))), defaultdict(list), []
 
-    sig_low, sig_high, tests = find_temperature_associated_residues(
+    sig_low, sig_high, tests = find_temperature_associated_residues_wt(
         records,
         correction=correction,
         alpha=alpha,
         min_group_size=min_group_size
     )
 
-    sub_mat, pair_signs = build_substitution_matrix_from_significant_positions(
+    sub_mat, pair_signs = build_substitution_matrix_from_significant_positions_wt(
         records, sig_low, sig_high
     )
     return sub_mat, pair_signs, tests
 
 
-def analyze_many_alignments_paper_like(
+def analyze_many_alignments_paper_like_wt(
     files,
     collapse_by_organism=True,
     correction="bonferroni",
@@ -476,7 +480,7 @@ def analyze_many_alignments_paper_like(
 
     for f in tqdm(files):
         try:
-            sub_mat, pair_signs, tests = analyze_alignment_paper_like(
+            sub_mat, pair_signs, tests = analyze_alignment_paper_like_wt(
                 f,
                 collapse_by_organism=collapse_by_organism,
                 correction=correction,
@@ -552,7 +556,7 @@ def matrix_to_relative_frequency(mat):
     return mat / total
 
 
-def plot_substitution_heatmap(sub_freq, sig_plus=None, title=None):
+def plot_substitution_heatmap_wt(sub_freq, sig_plus=None, title=None):
     muted = sns.color_palette("muted")
     muted_orange = muted[1]   # often the orange in muted
 
@@ -585,24 +589,17 @@ def plot_substitution_heatmap(sub_freq, sig_plus=None, title=None):
                             color="black", fontsize=5.5, fontweight="bold")
 
     plt.tight_layout()
-    plt.savefig(f"substitution_matrix_uniprot_IMG.pdf", bbox_inches="tight")
-    plt.show()
 
-# ============================================================
-# Settings
-# ============================================================
 
-AAS = "ACDEFGHIKLMNPQRSTVWY"
-AA_SET = set(AAS)
-aa2int = {aa: i for i, aa in enumerate(AAS)}
-int2aa = {i: aa for aa, i in aa2int.items()}
+
+
 
 
 # ============================================================
 # Core counting
 # ============================================================
 
-def build_paired_substitution_matrix(
+def build_paired_substitution_matrix_thor(
     df,
     wt_col="seq_wt",
     var_col="seq_var",
@@ -699,13 +696,13 @@ def build_paired_substitution_matrix(
     return sub_counts, pair_signs, n_pairs_used, total_substitutions
 
 
-def counts_to_relative_frequency(sub_counts):
+def counts_to_relative_frequency_thor(sub_counts):
     total = sub_counts.sum()
     if total == 0:
         return sub_counts.astype(float)
     return sub_counts / total
 
-def compute_preferred_direction_matrix(pair_signs_all, alpha=0.05, min_n=10, correction="fdr_bh"):
+def compute_preferred_direction_matrix_thor(pair_signs_all, alpha=0.05, min_n=10, correction="fdr_bh"):
     """
     Test whether one direction is preferred over the reverse.
 
@@ -773,7 +770,7 @@ def compute_preferred_direction_matrix(pair_signs_all, alpha=0.05, min_n=10, cor
 
     return sig_pref, pval_matrix, qval_matrix, ninfo_matrix
 
-def plot_substitution_heatmap(sub_freq, sig_pref=None, title="WT → Variant substitution frequencies"):
+def plot_substitution_heatmap_thor(sub_freq, sig_pref=None, title="WT → Variant substitution frequencies"):
     mm = 1 / 25.4
     fig_w = 55 * mm
     fig_h = 55 * mm
@@ -808,10 +805,9 @@ def plot_substitution_heatmap(sub_freq, sig_pref=None, title="WT → Variant sub
                             color="black", fontsize=5.5, fontweight="bold")
 
     plt.tight_layout()
-    plt.savefig(f"substitution_matrix_uniprot_THOR-epoch{epoch}.pdf", bbox_inches="tight")
-    plt.show()
 
-def substitution_table(sub_counts, sub_freq):
+
+def substitution_table_thor(sub_counts, sub_freq):
     rows = []
     for i in range(len(AAS)):
         for j in range(len(AAS)):
