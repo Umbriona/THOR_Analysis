@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 import re
 import shutil
@@ -10,6 +11,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+from scipy.stats import ttest_ind
+from statsmodels.stats.multitest import multipletests
 
 
 DEFAULT_RMSF_DELTA_CMAP = LinearSegmentedColormap.from_list(
@@ -731,6 +734,12 @@ def load_tsa_tm_delta_summary(
     ).reset_index(drop=True)
 
 
+def format_tm_delta_label(base_label: str, delta_tm_celsius: object) -> str:
+    if pd.isna(delta_tm_celsius):
+        return str(base_label)
+    return f"{base_label}  (dTm {float(delta_tm_celsius):+0.1f} C)"
+
+
 def build_tm_delta_row_label_map(tm_summary_df: pd.DataFrame) -> dict[str, str]:
     if tm_summary_df.empty:
         return {}
@@ -743,10 +752,7 @@ def build_tm_delta_row_label_map(tm_summary_df: pd.DataFrame) -> dict[str, str]:
     for row in variant_tm_summary_df.itertuples(index=False):
         short_label = short_variant_label(row.sample_name, row.family_id)
         delta_tm = row.delta_tm_to_wildtype_celsius
-        if pd.isna(delta_tm):
-            row_label_map[row.sample_name] = short_label
-        else:
-            row_label_map[row.sample_name] = f"{short_label}  (dTm {float(delta_tm):+0.1f} C)"
+        row_label_map[row.sample_name] = format_tm_delta_label(short_label, delta_tm)
 
     return row_label_map
 
@@ -1680,3 +1686,2743 @@ def plot_variant_pair_rmsf(
     delta_axis.set_ylabel("Variant - WT\nRMSF (A)", fontsize=label_size_pt)
 
     return figure, axes
+
+
+##########################################################################################
+# MD Variant Family Comparison Helpers
+##########################################################################################
+
+MD_VARIANT_DEFAULT_FAMILY_ORDER = [
+    "A0A2S1LEZ1",
+    "A0A372IUB3",
+    "MGYP001421927114",
+]
+MD_VARIANT_PAIR_METRICS = [
+    "residue_contact_pairs",
+    "saltbridge_pairs",
+    "hbond_pairs",
+]
+MD_VARIANT_INTERACTION_COUNT_METRICS = [
+    "residue_contacts",
+    "hbond_counts",
+    "saltbridge",
+]
+MD_VARIANT_INTERACTION_COUNT_COLUMN_MAP = {
+    "residue_contacts": "residue_contact_count",
+    "hbond_counts": "hbond_count",
+    "saltbridge": "saltbridge_count",
+}
+MD_VARIANT_INTERACTION_COUNT_LABEL_MAP = {
+    "residue_contacts": "Residue contacts",
+    "hbond_counts": "Hydrogen bonds",
+    "saltbridge": "Salt bridges",
+}
+MD_VARIANT_SIGNAL_COLUMNS = [
+    "rmsf_neighborhood_gain",
+    "contact_gain_total",
+    "saltbridge_gain_total",
+    "hbond_gain_total",
+    "sasa_neighborhood_gain",
+    "ordered_ss_neighborhood_gain",
+]
+MD_VARIANT_DELTA_CMAP = LinearSegmentedColormap.from_list(
+    "md_variant_delta",
+    ["#2166ac", "#f7f7f7", "#b2182b"],
+)
+MD_VARIANT_OCCUPANCY_CMAP = LinearSegmentedColormap.from_list(
+    "md_variant_occupancy",
+    ["#f7fbff", "#6baed6", "#08306b"],
+)
+MD_VARIANT_SIGNIFICANCE_THRESHOLDS = (
+    (0.001, "***"),
+    (0.01, "**"),
+    (0.05, "*"),
+)
+MD_VARIANT_BLOCK_SIZE_FRAMES = 100
+MD_VARIANT_BLOCK_PERMUTATIONS = 2000
+MD_VARIANT_BLOCK_TEST_SEED = 20260617
+
+
+@dataclass
+class MDVariantAnalysisBundle:
+    metric_window_suffix: str
+    metric_window_start: int
+    metric_window_stop: int
+    metadata_df: pd.DataFrame
+    replicate_count_by_system: dict[str, int]
+    local_residue_sets: dict[str, set[int]]
+    family_ids: list[str]
+    rmsf_summary_df: pd.DataFrame
+    sasa_summary_df: pd.DataFrame
+    ss_counts_summary_df: pd.DataFrame
+    ss_residue_summary_df: pd.DataFrame
+    interaction_count_summary_by_metric: dict[str, pd.DataFrame]
+    interaction_count_replicate_by_metric: dict[str, pd.DataFrame]
+    interaction_count_block_by_metric: dict[str, pd.DataFrame]
+    global_sasa_replicate_df: pd.DataFrame
+    pair_summary_by_metric: dict[str, pd.DataFrame]
+    rmsf_delta_df: pd.DataFrame
+    sasa_delta_df: pd.DataFrame
+    ss_residue_delta_df: pd.DataFrame
+    interaction_count_delta_by_metric: dict[str, pd.DataFrame]
+    pair_delta_by_metric: dict[str, pd.DataFrame]
+    variant_signal_df: pd.DataFrame
+    family_pattern_summary_df: pd.DataFrame
+
+
+def normalize_md_variant_metric_column_name(column_name: str) -> str:
+    return re.sub(r"[^0-9A-Za-z]+", "_", column_name.strip()).strip("_").lower()
+
+
+def parse_md_variant_residue_list(value: object) -> list[int]:
+    if pd.isna(value):
+        return []
+    value_text = str(value).strip()
+    if not value_text:
+        return []
+    return [int(token) for token in re.split(r"\s+", value_text) if token]
+
+
+def parse_md_variant_mutation_label_list(value: object) -> list[str]:
+    if pd.isna(value):
+        return []
+    value_text = str(value).strip()
+    if not value_text:
+        return []
+    return [token for token in value_text.split(";") if token]
+
+
+def wrap_md_variant_label(text: str, width: int = 28) -> str:
+    words = str(text).split()
+    if not words:
+        return str(text)
+
+    lines = []
+    current_line = []
+    current_length = 0
+    for word in words:
+        next_length = current_length + len(word) + (1 if current_line else 0)
+        if next_length > width:
+            lines.append(" ".join(current_line))
+            current_line = [word]
+            current_length = len(word)
+        else:
+            current_line.append(word)
+            current_length = next_length
+
+    if current_line:
+        lines.append(" ".join(current_line))
+    return "\n".join(lines)
+
+
+def save_md_variant_figure(figure, output_path: Path, dpi: int = 300) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=dpi, bbox_inches="tight")
+
+
+def order_md_variant_families(metadata_df: pd.DataFrame) -> list[str]:
+    family_set = set(metadata_df["family"].dropna().astype(str))
+    ordered_families = [
+        family_id for family_id in MD_VARIANT_DEFAULT_FAMILY_ORDER if family_id in family_set
+    ]
+    ordered_families.extend(sorted(family_set.difference(ordered_families)))
+    return ordered_families
+
+
+def load_md_variant_metadata(
+    mutation_metadata_path: Path,
+) -> pd.DataFrame:
+    metadata_df = pd.read_csv(mutation_metadata_path)
+    metadata_df = metadata_df.loc[
+        metadata_df["comparison_status"].isin(["wildtype", "ok"])
+    ].copy()
+    metadata_df["family"] = metadata_df["wt_system"]
+    metadata_df["is_wildtype"] = metadata_df["comparison_status"].eq("wildtype")
+    metadata_df["mutation_resids_list"] = metadata_df["mutation_resids"].apply(
+        parse_md_variant_residue_list
+    )
+    metadata_df["mutation_labels_list"] = metadata_df["mutation_labels"].apply(
+        parse_md_variant_mutation_label_list
+    )
+    metadata_df["short_label"] = metadata_df.apply(
+        lambda row: "WT"
+        if row["is_wildtype"]
+        else short_variant_label(str(row["system"]), str(row["family"])),
+        axis=1,
+    )
+    metadata_df = metadata_df.sort_values(
+        ["family", "is_wildtype", "mutation_count", "system"],
+        ascending=[True, False, True, True],
+    ).reset_index(drop=True)
+    return metadata_df
+
+
+def annotate_md_variant_metadata_with_tm(
+    metadata_df: pd.DataFrame,
+    tm_summary_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    annotated_df = metadata_df.copy()
+    tm_value_columns = [
+        "median_tm_celsius",
+        "wildtype_median_tm_celsius",
+        "delta_tm_to_wildtype_celsius",
+    ]
+
+    if tm_summary_df is not None and not tm_summary_df.empty:
+        tm_lookup_df = tm_summary_df[
+            [
+                "family_id",
+                "sample_name",
+                "median_tm_celsius",
+                "wildtype_median_tm_celsius",
+                "delta_tm_to_wildtype_celsius",
+            ]
+        ].drop_duplicates(subset=["family_id", "sample_name"]).rename(
+            columns={"family_id": "family", "sample_name": "system"}
+        )
+        annotated_df = annotated_df.drop(
+            columns=[column_name for column_name in tm_value_columns if column_name in annotated_df.columns],
+            errors="ignore",
+        ).merge(
+            tm_lookup_df,
+            on=["family", "system"],
+            how="left",
+        )
+    else:
+        for column_name in tm_value_columns:
+            if column_name not in annotated_df.columns:
+                annotated_df[column_name] = np.nan
+
+    annotated_df["tm_display_label"] = annotated_df.apply(
+        lambda row: row["short_label"]
+        if bool(row["is_wildtype"])
+        else format_tm_delta_label(row["short_label"], row["delta_tm_to_wildtype_celsius"]),
+        axis=1,
+    )
+    return annotated_df
+
+
+def get_md_variant_display_label(metadata_df: pd.DataFrame, system_name: str) -> str:
+    system_row_df = metadata_df.loc[metadata_df["system"].eq(system_name)]
+    if system_row_df.empty:
+        raise KeyError(f"Unknown MD variant system label: {system_name}")
+
+    if "tm_display_label" in system_row_df.columns and pd.notna(system_row_df["tm_display_label"].iat[0]):
+        return str(system_row_df["tm_display_label"].iat[0])
+    return str(system_row_df["short_label"].iat[0])
+
+
+def get_md_variant_display_label_from_row(row: object) -> str:
+    display_label = getattr(row, "tm_display_label", np.nan)
+    if pd.notna(display_label):
+        return str(display_label)
+    return str(getattr(row, "short_label"))
+
+
+def build_md_family_rmsf_panel_title(
+    variant_metadata: pd.Series,
+    label_wrap_width: int = 18,
+) -> str:
+    title_line = wrap_md_variant_label(
+        str(variant_metadata["short_label"]),
+        width=label_wrap_width,
+    )
+    subtitle_parts = []
+    if "delta_tm_to_wildtype_celsius" in variant_metadata.index and pd.notna(
+        variant_metadata["delta_tm_to_wildtype_celsius"]
+    ):
+        subtitle_parts.append(
+            f"dTm {float(variant_metadata['delta_tm_to_wildtype_celsius']):+0.1f} C"
+        )
+    subtitle_parts.append(f"{int(variant_metadata['mutation_count'])} mutations")
+    return "\n".join([title_line, " | ".join(subtitle_parts)])
+
+
+def parse_md_variant_metric_window_suffix(metric_window_suffix: str) -> tuple[int, int]:
+    suffix_match = re.fullmatch(r"(\d+)_(\d+)", str(metric_window_suffix))
+    if not suffix_match:
+        raise ValueError(
+            "Metric window suffix must look like '0_100000' or '0_300000', "
+            f"got '{metric_window_suffix}'"
+        )
+    return int(suffix_match.group(1)), int(suffix_match.group(2))
+
+
+def discover_md_variant_metric_window_suffixes(
+    metric_dir: Path,
+    metric_name: str,
+) -> list[str]:
+    pattern = re.compile(
+        rf"^all_systems_{re.escape(metric_name)}_(\d+)_(\d+)\.csv$"
+    )
+    suffixes = []
+    for metric_path in sorted(metric_dir.glob(f"all_systems_{metric_name}_*.csv")):
+        match = pattern.match(metric_path.name)
+        if match:
+            suffixes.append(f"{match.group(1)}_{match.group(2)}")
+    return suffixes
+
+
+def resolve_md_variant_metric_window_suffix(
+    metric_dir: Path,
+    required_metrics: Iterable[str],
+    metric_window: str | int | None = "latest",
+) -> str:
+    required_metrics = [str(metric_name) for metric_name in required_metrics]
+    available_suffixes_by_metric = {
+        metric_name: set(
+            discover_md_variant_metric_window_suffixes(metric_dir, metric_name)
+        )
+        for metric_name in required_metrics
+    }
+    missing_metrics = [
+        metric_name
+        for metric_name, suffixes in available_suffixes_by_metric.items()
+        if not suffixes
+    ]
+    if missing_metrics:
+        raise FileNotFoundError(
+            "Missing combined metric CSVs for: "
+            + ", ".join(sorted(missing_metrics))
+        )
+
+    common_suffixes = sorted(
+        set.intersection(*available_suffixes_by_metric.values()),
+        key=lambda suffix: parse_md_variant_metric_window_suffix(suffix)[1],
+    )
+    if not common_suffixes:
+        raise FileNotFoundError(
+            "No shared metric window was found across the required metrics. "
+            "Check that all combined CSVs were generated for the same simulation window."
+        )
+
+    if metric_window in (None, "latest"):
+        return common_suffixes[-1]
+
+    if isinstance(metric_window, int):
+        requested_suffix = f"0_{metric_window}"
+    else:
+        requested_text = str(metric_window).strip()
+        if re.fullmatch(r"\d+", requested_text):
+            requested_suffix = f"0_{requested_text}"
+        else:
+            requested_suffix = requested_text
+
+    if requested_suffix not in common_suffixes:
+        raise FileNotFoundError(
+            f"Requested metric window '{requested_suffix}' is not available for all required metrics. "
+            f"Shared available windows: {', '.join(common_suffixes)}"
+        )
+    return requested_suffix
+
+
+def read_md_variant_metric_table(
+    metric_dir: Path,
+    metric_name: str,
+    metric_window_suffix: str,
+) -> pd.DataFrame:
+    metric_path = metric_dir / f"all_systems_{metric_name}_{metric_window_suffix}.csv"
+    metric_df = pd.read_csv(metric_path, low_memory=False)
+    metric_df.columns = [
+        normalize_md_variant_metric_column_name(column_name)
+        for column_name in metric_df.columns
+    ]
+    if metric_name == "rmsf":
+        if "resid" not in metric_df.columns and "frame" in metric_df.columns:
+            metric_df["resid"] = (
+                pd.to_numeric(metric_df["frame"], errors="coerce")
+                .round()
+                .astype("Int64")
+            )
+        if "resname" not in metric_df.columns:
+            metric_df["resname"] = pd.NA
+    return metric_df
+
+
+def compute_md_variant_replicate_counts(metric_df: pd.DataFrame) -> dict[str, int]:
+    return (
+        metric_df.groupby("system")["replicate"].nunique().astype(int).to_dict()
+    )
+
+
+def backfill_md_variant_rmsf_resnames(
+    rmsf_df: pd.DataFrame,
+    residue_reference_df: pd.DataFrame,
+) -> pd.DataFrame:
+    if "resname" in rmsf_df.columns and rmsf_df["resname"].notna().all():
+        return rmsf_df
+
+    residue_lookup_df = (
+        residue_reference_df[
+            ["system", "replicate", "replicate_index", "resid", "resname"]
+        ]
+        .dropna(subset=["resid"])
+        .drop_duplicates()
+    )
+    enriched_df = rmsf_df.merge(
+        residue_lookup_df,
+        on=["system", "replicate", "replicate_index", "resid"],
+        how="left",
+        suffixes=("", "_reference"),
+    )
+    if "resname_reference" in enriched_df.columns:
+        enriched_df["resname"] = enriched_df["resname"].fillna(
+            enriched_df["resname_reference"]
+        )
+        enriched_df = enriched_df.drop(columns=["resname_reference"])
+    enriched_df["resname"] = enriched_df["resname"].fillna("UNK")
+    return enriched_df
+
+
+def load_md_variant_local_residue_sets(
+    metadata_df: pd.DataFrame,
+    rmsf_raw_df: pd.DataFrame,
+    mutation_neighborhood_df: pd.DataFrame,
+) -> dict[str, set[int]]:
+    neighborhood_residue_sets = {}
+    if not mutation_neighborhood_df.empty:
+        neighborhood_residue_sets = (
+            mutation_neighborhood_df.groupby("system")["neighbor_resid"]
+            .apply(lambda values: {int(value) for value in values})
+            .to_dict()
+        )
+
+    rmsf_near_sets = {}
+    if "near_mutation" in rmsf_raw_df.columns:
+        rmsf_near_sets = (
+            rmsf_raw_df.loc[rmsf_raw_df["near_mutation"].fillna(False)]
+            .groupby("system")["resid"]
+            .apply(lambda values: {int(value) for value in values})
+            .to_dict()
+        )
+
+    local_residue_sets = {}
+    for row in metadata_df.itertuples(index=False):
+        system_name = str(row.system)
+        residue_set = set(int(value) for value in row.mutation_resids_list)
+        residue_set.update(neighborhood_residue_sets.get(system_name, set()))
+        residue_set.update(rmsf_near_sets.get(system_name, set()))
+        local_residue_sets[system_name] = residue_set
+
+    return local_residue_sets
+
+
+def aggregate_md_variant_residue_metric(
+    metric_df: pd.DataFrame,
+    value_columns: list[str],
+) -> pd.DataFrame:
+    optional_columns = [
+        column_name
+        for column_name in ["contains_mutation_residue", "near_mutation"]
+        if column_name in metric_df.columns
+    ]
+    per_replicate_df = (
+        metric_df[
+            [
+                "system",
+                "replicate",
+                "replicate_index",
+                "resid",
+                "resname",
+                *optional_columns,
+                *value_columns,
+            ]
+        ]
+        .groupby(
+            ["system", "replicate", "replicate_index", "resid", "resname"],
+            as_index=False,
+        )
+        .agg(
+            {
+                **{column_name: "mean" for column_name in value_columns},
+                **{column_name: "max" for column_name in optional_columns},
+            }
+        )
+    )
+
+    system_level_df = (
+        per_replicate_df.groupby(["system", "resid"], as_index=False)
+        .agg(
+            {
+                "resname": "first",
+                "replicate": "nunique",
+                **{column_name: "max" for column_name in optional_columns},
+                **{column_name: ["mean", "std"] for column_name in value_columns},
+            }
+        )
+    )
+    system_level_df.columns = [
+        "system",
+        "resid",
+        "resname",
+        "n_replicates",
+        *optional_columns,
+        *[
+            f"{column_name}_{statistic}"
+            for column_name in value_columns
+            for statistic in ["mean", "std"]
+        ],
+    ]
+    for column_name in value_columns:
+        std_column = f"{column_name}_std"
+        system_level_df[std_column] = system_level_df[std_column].fillna(0.0)
+    return system_level_df
+
+
+def aggregate_md_variant_secondary_structure_counts(metric_df: pd.DataFrame) -> pd.DataFrame:
+    per_replicate_df = (
+        metric_df.groupby(["system", "replicate", "replicate_index"], as_index=False)
+        .agg(
+            helix_fraction=("helix_fraction", "mean"),
+            strand_fraction=("strand_fraction", "mean"),
+            loop_fraction=("loop_fraction", "mean"),
+        )
+    )
+    per_replicate_df["ordered_fraction"] = (
+        per_replicate_df["helix_fraction"] + per_replicate_df["strand_fraction"]
+    )
+
+    system_level_df = (
+        per_replicate_df.groupby("system", as_index=False)
+        .agg(
+            n_replicates=("replicate", "nunique"),
+            helix_fraction_mean=("helix_fraction", "mean"),
+            helix_fraction_std=("helix_fraction", "std"),
+            strand_fraction_mean=("strand_fraction", "mean"),
+            strand_fraction_std=("strand_fraction", "std"),
+            loop_fraction_mean=("loop_fraction", "mean"),
+            loop_fraction_std=("loop_fraction", "std"),
+            ordered_fraction_mean=("ordered_fraction", "mean"),
+            ordered_fraction_std=("ordered_fraction", "std"),
+        )
+    )
+    std_columns = [
+        column_name
+        for column_name in system_level_df.columns
+        if column_name.endswith("_std")
+    ]
+    system_level_df[std_columns] = system_level_df[std_columns].fillna(0.0)
+    return system_level_df
+
+
+def aggregate_md_variant_interaction_count_metric(
+    metric_df: pd.DataFrame,
+    value_column: str,
+) -> pd.DataFrame:
+    prepared_df = metric_df.copy()
+    prepared_df["frame"] = pd.to_numeric(prepared_df["frame"], errors="coerce").round().astype("Int64")
+    prepared_df[value_column] = pd.to_numeric(prepared_df[value_column], errors="coerce")
+    prepared_df = prepared_df.dropna(subset=["frame", value_column]).copy()
+    prepared_df["frame"] = prepared_df["frame"].astype(int)
+
+    per_replicate_df = (
+        prepared_df[["system", "replicate", "replicate_index", "frame", value_column]]
+        .groupby(["system", "replicate", "replicate_index", "frame"], as_index=False)
+        .agg({value_column: "mean"})
+    )
+
+    system_level_df = (
+        per_replicate_df.groupby(["system", "frame"], as_index=False)
+        .agg(
+            n_replicates=("replicate", "nunique"),
+            count_mean=(value_column, "mean"),
+            count_std=(value_column, "std"),
+        )
+    )
+    system_level_df["count_std"] = system_level_df["count_std"].fillna(0.0)
+    system_level_df["time_ps"] = system_level_df["frame"].astype(float)
+    system_level_df["time_ns"] = system_level_df["time_ps"] / 1000.0
+    return system_level_df.sort_values(["system", "frame"]).reset_index(drop=True)
+
+
+def compute_md_variant_interaction_count_replicate_table(
+    metric_df: pd.DataFrame,
+    value_column: str,
+) -> pd.DataFrame:
+    prepared_df = metric_df.copy()
+    prepared_df["frame"] = pd.to_numeric(prepared_df["frame"], errors="coerce").round().astype("Int64")
+    prepared_df[value_column] = pd.to_numeric(prepared_df[value_column], errors="coerce")
+    prepared_df = prepared_df.dropna(subset=["frame", value_column]).copy()
+    prepared_df["frame"] = prepared_df["frame"].astype(int)
+
+    per_replicate_df = (
+        prepared_df.groupby(["system", "replicate", "replicate_index"], as_index=False)
+        .agg(
+            n_frames=("frame", "nunique"),
+            replicate_mean=(value_column, "mean"),
+            replicate_std=(value_column, "std"),
+        )
+    )
+    per_replicate_df["replicate_std"] = per_replicate_df["replicate_std"].fillna(0.0)
+    return per_replicate_df.sort_values(
+        ["system", "replicate_index", "replicate"]
+    ).reset_index(drop=True)
+
+
+def compute_md_variant_interaction_count_block_table(
+    metric_df: pd.DataFrame,
+    value_column: str,
+    block_size_frames: int = MD_VARIANT_BLOCK_SIZE_FRAMES,
+) -> pd.DataFrame:
+    if block_size_frames <= 0:
+        raise ValueError("block_size_frames must be positive")
+
+    prepared_df = metric_df.copy()
+    prepared_df["frame"] = pd.to_numeric(prepared_df["frame"], errors="coerce").round().astype("Int64")
+    prepared_df[value_column] = pd.to_numeric(prepared_df[value_column], errors="coerce")
+    prepared_df = prepared_df.dropna(subset=["frame", value_column]).copy()
+    prepared_df["frame"] = prepared_df["frame"].astype(int)
+    prepared_df = prepared_df.sort_values(["system", "replicate_index", "replicate", "frame"]).reset_index(drop=True)
+    prepared_df["frame_rank"] = prepared_df.groupby(
+        ["system", "replicate", "replicate_index"]
+    ).cumcount()
+    prepared_df["block_index"] = prepared_df["frame_rank"] // int(block_size_frames)
+
+    block_df = (
+        prepared_df.groupby(["system", "replicate", "replicate_index", "block_index"], as_index=False)
+        .agg(
+            block_start_frame=("frame", "min"),
+            block_stop_frame=("frame", "max"),
+            n_frames=("frame", "size"),
+            block_mean=(value_column, "mean"),
+            block_std=(value_column, "std"),
+        )
+    )
+    block_df["block_std"] = block_df["block_std"].fillna(0.0)
+    block_df["block_size_frames"] = int(block_size_frames)
+    block_df["block_mid_frame"] = (
+        block_df["block_start_frame"] + block_df["block_stop_frame"]
+    ) / 2.0
+    block_df["block_mid_ns"] = block_df["block_mid_frame"] / 1000.0
+    return block_df.sort_values(
+        ["system", "replicate_index", "replicate", "block_index"]
+    ).reset_index(drop=True)
+
+
+def compute_md_variant_global_sasa_replicate_table(metric_df: pd.DataFrame) -> pd.DataFrame:
+    required_columns = {"system", "replicate", "replicate_index", "resid", "mean_sasa"}
+    missing_columns = required_columns.difference(metric_df.columns)
+    if missing_columns:
+        missing_str = ", ".join(sorted(missing_columns))
+        raise KeyError(
+            "Cannot compute global SASA replicate table because required columns are "
+            f"missing: {missing_str}"
+        )
+
+    per_replicate_df = (
+        metric_df.groupby(["system", "replicate", "replicate_index"], as_index=False)
+        .agg(
+            residue_count=("resid", "nunique"),
+            global_mean_sasa=("mean_sasa", "sum"),
+        )
+    )
+    per_replicate_df["mean_sasa_per_residue"] = (
+        per_replicate_df["global_mean_sasa"] / per_replicate_df["residue_count"]
+    )
+    return per_replicate_df.sort_values(
+        ["system", "replicate_index", "replicate"]
+    ).reset_index(drop=True)
+
+
+def prepare_md_variant_pair_metric(metric_df: pd.DataFrame, metric_name: str) -> pd.DataFrame:
+    prepared_df = metric_df.copy()
+
+    if metric_name == "hbond_pairs":
+        prepared_df["resid_a"] = prepared_df["donor_resid"].astype(int)
+        prepared_df["resname_a"] = prepared_df["donor_resname"].astype(str)
+        prepared_df["resid_b"] = prepared_df["acceptor_resid"].astype(int)
+        prepared_df["resname_b"] = prepared_df["acceptor_resname"].astype(str)
+        prepared_df["pair_key"] = (
+            prepared_df["resid_a"].astype(str)
+            + "|"
+            + prepared_df["resname_a"]
+            + "->"
+            + prepared_df["resid_b"].astype(str)
+            + "|"
+            + prepared_df["resname_b"]
+        )
+        prepared_df["pair_label"] = (
+            prepared_df["resname_a"]
+            + prepared_df["resid_a"].astype(str)
+            + " -> "
+            + prepared_df["resname_b"]
+            + prepared_df["resid_b"].astype(str)
+        )
+    else:
+        first_is_lower = (
+            prepared_df["resid_i"].astype(int) <= prepared_df["resid_j"].astype(int)
+        )
+        prepared_df["resid_a"] = np.where(
+            first_is_lower,
+            prepared_df["resid_i"],
+            prepared_df["resid_j"],
+        ).astype(int)
+        prepared_df["resname_a"] = np.where(
+            first_is_lower,
+            prepared_df["resname_i"],
+            prepared_df["resname_j"],
+        ).astype(str)
+        prepared_df["resid_b"] = np.where(
+            first_is_lower,
+            prepared_df["resid_j"],
+            prepared_df["resid_i"],
+        ).astype(int)
+        prepared_df["resname_b"] = np.where(
+            first_is_lower,
+            prepared_df["resname_j"],
+            prepared_df["resname_i"],
+        ).astype(str)
+        prepared_df["pair_key"] = (
+            prepared_df["resid_a"].astype(str)
+            + "|"
+            + prepared_df["resname_a"]
+            + "|"
+            + prepared_df["resid_b"].astype(str)
+            + "|"
+            + prepared_df["resname_b"]
+        )
+        prepared_df["pair_label"] = (
+            prepared_df["resname_a"]
+            + prepared_df["resid_a"].astype(str)
+            + " - "
+            + prepared_df["resname_b"]
+            + prepared_df["resid_b"].astype(str)
+        )
+
+    prepared_df["occupancy"] = prepared_df["occupancy"].astype(float)
+    return prepared_df
+
+
+def significance_stars(p_value: float | None) -> str:
+    if p_value is None or not np.isfinite(p_value):
+        return ""
+    for threshold, stars in MD_VARIANT_SIGNIFICANCE_THRESHOLDS:
+        if p_value < threshold:
+            return stars
+    return ""
+
+
+def _compute_welch_ttest(
+    variant_values: np.ndarray,
+    wildtype_values: np.ndarray,
+) -> tuple[float, float]:
+    variant_values = np.asarray(variant_values, dtype=float)
+    wildtype_values = np.asarray(wildtype_values, dtype=float)
+    variant_values = variant_values[np.isfinite(variant_values)]
+    wildtype_values = wildtype_values[np.isfinite(wildtype_values)]
+
+    if variant_values.size < 2 or wildtype_values.size < 2:
+        return np.nan, np.nan
+
+    if (
+        np.allclose(variant_values, variant_values[0], equal_nan=False)
+        and np.allclose(wildtype_values, wildtype_values[0], equal_nan=False)
+        and np.isclose(variant_values[0], wildtype_values[0])
+    ):
+        return 0.0, 1.0
+
+    statistic, p_value = ttest_ind(
+        variant_values,
+        wildtype_values,
+        equal_var=False,
+        nan_policy="omit",
+    )
+    if not np.isfinite(statistic) or not np.isfinite(p_value):
+        return np.nan, np.nan
+    return float(statistic), float(p_value)
+
+
+def _compute_two_sample_ks_statistic(
+    variant_values: np.ndarray,
+    wildtype_values: np.ndarray,
+) -> float:
+    variant_values = np.sort(np.asarray(variant_values, dtype=float))
+    wildtype_values = np.sort(np.asarray(wildtype_values, dtype=float))
+    combined_values = np.sort(np.concatenate([variant_values, wildtype_values]))
+    if combined_values.size == 0:
+        return np.nan
+
+    variant_cdf = np.searchsorted(variant_values, combined_values, side="right") / variant_values.size
+    wildtype_cdf = np.searchsorted(wildtype_values, combined_values, side="right") / wildtype_values.size
+    return float(np.max(np.abs(variant_cdf - wildtype_cdf)))
+
+
+def _compute_block_permutation_ks_test(
+    variant_values: np.ndarray,
+    wildtype_values: np.ndarray,
+    n_permutations: int = MD_VARIANT_BLOCK_PERMUTATIONS,
+    random_seed: int = MD_VARIANT_BLOCK_TEST_SEED,
+) -> tuple[float, float]:
+    variant_values = np.asarray(variant_values, dtype=float)
+    wildtype_values = np.asarray(wildtype_values, dtype=float)
+    variant_values = variant_values[np.isfinite(variant_values)]
+    wildtype_values = wildtype_values[np.isfinite(wildtype_values)]
+
+    if variant_values.size < 2 or wildtype_values.size < 2:
+        return np.nan, np.nan
+
+    observed_statistic = _compute_two_sample_ks_statistic(variant_values, wildtype_values)
+    if not np.isfinite(observed_statistic):
+        return np.nan, np.nan
+    if np.isclose(observed_statistic, 0.0):
+        return 0.0, 1.0
+
+    pooled_values = np.concatenate([variant_values, wildtype_values])
+    n_variant = int(variant_values.size)
+    rng = np.random.default_rng(random_seed)
+    exceed_count = 1
+
+    for _ in range(int(n_permutations)):
+        permuted_values = rng.permutation(pooled_values)
+        permuted_variant = permuted_values[:n_variant]
+        permuted_wildtype = permuted_values[n_variant:]
+        permuted_statistic = _compute_two_sample_ks_statistic(
+            permuted_variant,
+            permuted_wildtype,
+        )
+        if permuted_statistic >= observed_statistic - 1e-12:
+            exceed_count += 1
+
+    p_value = exceed_count / (int(n_permutations) + 1)
+    return float(observed_statistic), float(p_value)
+
+
+def compute_md_variant_absolute_metric_significance_df(
+    family_id: str,
+    metadata_df: pd.DataFrame,
+    interaction_count_block_by_metric: dict[str, pd.DataFrame],
+    interaction_count_replicate_by_metric: dict[str, pd.DataFrame],
+    global_sasa_replicate_df: pd.DataFrame,
+    adjust_method: str = "fdr_bh",
+) -> pd.DataFrame:
+    family_metadata_df = metadata_df.loc[metadata_df["family"].eq(family_id)].copy()
+    if family_metadata_df.empty:
+        return pd.DataFrame()
+
+    wildtype_system = family_metadata_df.loc[
+        family_metadata_df["is_wildtype"],
+        "system",
+    ].iat[0]
+    system_order = compute_md_variant_system_order(metadata_df, family_id)
+    variant_systems = [system_name for system_name in system_order if system_name != wildtype_system]
+
+    metric_specs = [
+        (
+            "residue_contacts",
+            MD_VARIANT_INTERACTION_COUNT_LABEL_MAP["residue_contacts"],
+            interaction_count_block_by_metric["residue_contacts"],
+            "block_mean",
+            "block_permutation_ks",
+        ),
+        (
+            "hbond_counts",
+            MD_VARIANT_INTERACTION_COUNT_LABEL_MAP["hbond_counts"],
+            interaction_count_block_by_metric["hbond_counts"],
+            "block_mean",
+            "block_permutation_ks",
+        ),
+        (
+            "saltbridge",
+            MD_VARIANT_INTERACTION_COUNT_LABEL_MAP["saltbridge"],
+            interaction_count_block_by_metric["saltbridge"],
+            "block_mean",
+            "block_permutation_ks",
+        ),
+        (
+            "global_sasa",
+            "Global SASA",
+            global_sasa_replicate_df.loc[global_sasa_replicate_df["family"].eq(family_id)].copy(),
+            "global_mean_sasa",
+            "welch_ttest",
+        ),
+    ]
+
+    rows = []
+    for metric_key, metric_label, metric_df, value_column, test_name in metric_specs:
+        metric_df = metric_df.loc[metric_df["system"].isin(system_order)].copy()
+        wildtype_values = (
+            metric_df.loc[metric_df["system"].eq(wildtype_system), value_column]
+            .astype(float)
+            .dropna()
+            .to_numpy()
+        )
+        for system_name in variant_systems:
+            variant_values = (
+                metric_df.loc[metric_df["system"].eq(system_name), value_column]
+                .astype(float)
+                .dropna()
+                .to_numpy()
+            )
+            if test_name == "block_permutation_ks":
+                statistic, p_value = _compute_block_permutation_ks_test(
+                    variant_values,
+                    wildtype_values,
+                )
+            else:
+                statistic, p_value = _compute_welch_ttest(variant_values, wildtype_values)
+            variant_label = family_metadata_df.loc[
+                family_metadata_df["system"].eq(system_name),
+                "short_label",
+            ].iat[0]
+            rows.append(
+                {
+                    "family": family_id,
+                    "system": system_name,
+                    "short_label": variant_label,
+                    "wildtype_system": wildtype_system,
+                    "metric_key": metric_key,
+                    "metric_label": metric_label,
+                    "test_name": test_name,
+                    "n_variant_samples": int(variant_values.size),
+                    "n_wildtype_samples": int(wildtype_values.size),
+                    "variant_mean": float(np.mean(variant_values)) if variant_values.size else np.nan,
+                    "wildtype_mean": float(np.mean(wildtype_values)) if wildtype_values.size else np.nan,
+                    "mean_difference": (
+                        float(np.mean(variant_values) - np.mean(wildtype_values))
+                        if variant_values.size and wildtype_values.size
+                        else np.nan
+                    ),
+                    "test_statistic": statistic,
+                    "p_value": p_value,
+                }
+            )
+
+    significance_df = pd.DataFrame(rows)
+    if significance_df.empty:
+        return significance_df
+
+    significance_df["p_value_fdr"] = np.nan
+    significance_df["significant_fdr"] = False
+    valid_mask = significance_df["p_value"].notna()
+    if valid_mask.any():
+        reject, p_value_fdr, _, _ = multipletests(
+            significance_df.loc[valid_mask, "p_value"].to_numpy(dtype=float),
+            method=adjust_method,
+        )
+        significance_df.loc[valid_mask, "p_value_fdr"] = p_value_fdr
+        significance_df.loc[valid_mask, "significant_fdr"] = reject
+
+    significance_df["stars"] = significance_df["p_value_fdr"].map(significance_stars)
+    significance_df["direction_vs_wt"] = np.where(
+        significance_df["mean_difference"] > 0,
+        "higher",
+        np.where(significance_df["mean_difference"] < 0, "lower", "same"),
+    )
+    return significance_df.sort_values(
+        ["family", "metric_key", "system"]
+    ).reset_index(drop=True)
+
+
+def aggregate_md_variant_pair_metric(
+    metric_df: pd.DataFrame,
+    replicate_count_by_system: dict[str, int],
+) -> pd.DataFrame:
+    per_replicate_df = (
+        metric_df.groupby(["system", "replicate", "pair_key"], as_index=False)
+        .agg(
+            pair_label=("pair_label", "first"),
+            resid_a=("resid_a", "first"),
+            resname_a=("resname_a", "first"),
+            resid_b=("resid_b", "first"),
+            resname_b=("resname_b", "first"),
+            occupancy=("occupancy", "mean"),
+        )
+    )
+    summary_df = (
+        per_replicate_df.groupby(["system", "pair_key"], as_index=False)
+        .agg(
+            pair_label=("pair_label", "first"),
+            resid_a=("resid_a", "first"),
+            resname_a=("resname_a", "first"),
+            resid_b=("resid_b", "first"),
+            resname_b=("resname_b", "first"),
+            occupancy_sum=("occupancy", "sum"),
+            replicates_present=("replicate", "nunique"),
+        )
+    )
+    summary_df["replicate_count"] = summary_df["system"].map(replicate_count_by_system).astype(int)
+    summary_df["occupancy_mean"] = summary_df["occupancy_sum"] / summary_df["replicate_count"]
+    return summary_df
+
+
+def compute_md_variant_system_order(metadata_df: pd.DataFrame, family_id: str) -> list[str]:
+    family_metadata_df = metadata_df.loc[metadata_df["family"].eq(family_id)].copy()
+    family_metadata_df["sort_order"] = np.where(
+        family_metadata_df["is_wildtype"],
+        -1,
+        family_metadata_df["mutation_count"],
+    )
+    family_metadata_df = family_metadata_df.sort_values(
+        ["is_wildtype", "sort_order", "system"],
+        ascending=[False, True, True],
+    )
+    return family_metadata_df["system"].tolist()
+
+
+def compute_md_variant_order(metadata_df: pd.DataFrame, family_id: str) -> list[str]:
+    family_metadata_df = metadata_df.loc[
+        metadata_df["family"].eq(family_id) & (~metadata_df["is_wildtype"])
+    ].copy()
+    family_metadata_df = family_metadata_df.sort_values(
+        ["mutation_count", "system"],
+        ascending=[True, True],
+    )
+    return family_metadata_df["system"].tolist()
+
+
+def build_md_variant_family_color_map(
+    metadata_df: pd.DataFrame,
+    family_id: str,
+) -> dict[str, object]:
+    variant_order = compute_md_variant_order(metadata_df, family_id)
+    color_values = plt.get_cmap("tab20", max(1, len(variant_order)))
+    return {
+        system_name: color_values(index)
+        for index, system_name in enumerate(variant_order)
+    }
+
+
+def compute_md_variant_residue_delta_table(
+    summary_df: pd.DataFrame,
+    metadata_df: pd.DataFrame,
+    family_id: str,
+    value_columns: list[str],
+) -> pd.DataFrame:
+    family_metadata_df = metadata_df.loc[metadata_df["family"].eq(family_id)].copy()
+    wildtype_system = family_metadata_df.loc[
+        family_metadata_df["is_wildtype"],
+        "system",
+    ].iat[0]
+    wildtype_df = summary_df.loc[summary_df["system"].eq(wildtype_system)].copy()
+
+    wildtype_column_map = {"resname": "wt_resname"}
+    for value_column in value_columns:
+        wildtype_column_map[f"{value_column}_mean"] = f"wt_{value_column}_mean"
+        wildtype_column_map[f"{value_column}_std"] = f"wt_{value_column}_std"
+    wildtype_df = wildtype_df.rename(columns=wildtype_column_map)
+    wildtype_df = wildtype_df[
+        ["resid", *wildtype_column_map.values()]
+    ]
+
+    family_rows = []
+    for row in family_metadata_df.loc[~family_metadata_df["is_wildtype"]].itertuples(index=False):
+        variant_df = summary_df.loc[summary_df["system"].eq(row.system)].copy()
+        variant_df = variant_df.merge(wildtype_df, on="resid", how="inner")
+        variant_df["family"] = family_id
+        variant_df["wt_system"] = wildtype_system
+        variant_df["variant_system"] = row.system
+        variant_df["variant_label"] = get_md_variant_display_label_from_row(row)
+        variant_df["mutation_count"] = int(row.mutation_count)
+        variant_df["is_mutation_site"] = variant_df["resid"].isin(row.mutation_resids_list)
+        for value_column in value_columns:
+            variant_df[f"delta_{value_column}"] = (
+                variant_df[f"{value_column}_mean"] - variant_df[f"wt_{value_column}_mean"]
+            )
+        family_rows.append(variant_df)
+
+    if not family_rows:
+        return pd.DataFrame()
+    return pd.concat(family_rows, ignore_index=True)
+
+
+def compute_md_variant_pair_delta_table(
+    summary_df: pd.DataFrame,
+    metadata_df: pd.DataFrame,
+    family_id: str,
+    local_residue_sets: dict[str, set[int]],
+) -> pd.DataFrame:
+    family_metadata_df = metadata_df.loc[metadata_df["family"].eq(family_id)].copy()
+    wildtype_system = family_metadata_df.loc[
+        family_metadata_df["is_wildtype"],
+        "system",
+    ].iat[0]
+    wildtype_df = summary_df.loc[summary_df["system"].eq(wildtype_system)].copy()
+    wildtype_df = wildtype_df.rename(
+        columns={
+            "occupancy_mean": "wt_occupancy_mean",
+            "pair_label": "wt_pair_label",
+            "resid_a": "wt_resid_a",
+            "resname_a": "wt_resname_a",
+            "resid_b": "wt_resid_b",
+            "resname_b": "wt_resname_b",
+        }
+    )
+
+    family_rows = []
+    for row in family_metadata_df.loc[~family_metadata_df["is_wildtype"]].itertuples(index=False):
+        variant_df = summary_df.loc[summary_df["system"].eq(row.system)].copy()
+        merged_df = variant_df.merge(
+            wildtype_df[
+                [
+                    "pair_key",
+                    "wt_pair_label",
+                    "wt_resid_a",
+                    "wt_resname_a",
+                    "wt_resid_b",
+                    "wt_resname_b",
+                    "wt_occupancy_mean",
+                ]
+            ],
+            on="pair_key",
+            how="outer",
+        )
+        merged_df["pair_label"] = merged_df["pair_label"].combine_first(merged_df["wt_pair_label"])
+        merged_df["resid_a"] = merged_df["resid_a"].combine_first(merged_df["wt_resid_a"]).astype(int)
+        merged_df["resname_a"] = merged_df["resname_a"].combine_first(merged_df["wt_resname_a"])
+        merged_df["resid_b"] = merged_df["resid_b"].combine_first(merged_df["wt_resid_b"]).astype(int)
+        merged_df["resname_b"] = merged_df["resname_b"].combine_first(merged_df["wt_resname_b"])
+        merged_df["occupancy_mean"] = merged_df["occupancy_mean"].fillna(0.0)
+        merged_df["wt_occupancy_mean"] = merged_df["wt_occupancy_mean"].fillna(0.0)
+        merged_df["delta_occupancy"] = (
+            merged_df["occupancy_mean"] - merged_df["wt_occupancy_mean"]
+        )
+        merged_df["family"] = family_id
+        merged_df["wt_system"] = wildtype_system
+        merged_df["variant_system"] = row.system
+        merged_df["variant_label"] = get_md_variant_display_label_from_row(row)
+
+        mutation_resids = set(int(value) for value in row.mutation_resids_list)
+        local_resids = local_residue_sets.get(str(row.system), set())
+        merged_df["contains_mutation_pair"] = (
+            merged_df["resid_a"].isin(mutation_resids)
+            | merged_df["resid_b"].isin(mutation_resids)
+        )
+        merged_df["is_local_pair"] = (
+            merged_df["resid_a"].isin(local_resids)
+            | merged_df["resid_b"].isin(local_resids)
+        )
+        family_rows.append(merged_df)
+
+    if not family_rows:
+        return pd.DataFrame()
+    return pd.concat(family_rows, ignore_index=True)
+
+
+def compute_md_variant_frame_delta_table(
+    summary_df: pd.DataFrame,
+    metadata_df: pd.DataFrame,
+    family_id: str,
+) -> pd.DataFrame:
+    family_metadata_df = metadata_df.loc[metadata_df["family"].eq(family_id)].copy()
+    wildtype_system = family_metadata_df.loc[
+        family_metadata_df["is_wildtype"],
+        "system",
+    ].iat[0]
+    wildtype_df = summary_df.loc[summary_df["system"].eq(wildtype_system)].copy()
+    wildtype_df = wildtype_df.rename(
+        columns={
+            "count_mean": "wt_count_mean",
+            "count_std": "wt_count_std",
+        }
+    )
+    wildtype_df = wildtype_df[["frame", "wt_count_mean", "wt_count_std"]]
+
+    family_rows = []
+    for row in family_metadata_df.loc[~family_metadata_df["is_wildtype"]].itertuples(index=False):
+        variant_df = summary_df.loc[summary_df["system"].eq(row.system)].copy()
+        variant_df = variant_df.merge(wildtype_df, on="frame", how="inner")
+        variant_df["family"] = family_id
+        variant_df["wt_system"] = wildtype_system
+        variant_df["variant_system"] = row.system
+        variant_df["variant_label"] = get_md_variant_display_label_from_row(row)
+        variant_df["mutation_count"] = int(row.mutation_count)
+        variant_df["delta_count"] = (
+            variant_df["count_mean"] - variant_df["wt_count_mean"]
+        )
+        family_rows.append(variant_df)
+
+    if not family_rows:
+        return pd.DataFrame()
+    return pd.concat(family_rows, ignore_index=True)
+
+
+def compute_md_family_residue_interest_df(
+    rmsf_delta_df: pd.DataFrame,
+    family_id: str,
+) -> pd.DataFrame:
+    family_delta_df = rmsf_delta_df.loc[rmsf_delta_df["family"].eq(family_id)].copy()
+    if family_delta_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "family",
+                "resid",
+                "resname",
+                "mean_delta_rmsf",
+                "mean_abs_delta_rmsf",
+                "max_abs_delta_rmsf",
+                "mean_abs_standardized_delta_rmsf",
+                "n_variants",
+                "fraction_variants_lower_than_wt",
+                "interest_rank",
+            ]
+        )
+
+    pooled_sd = np.sqrt(
+        np.square(family_delta_df["rmsf_std"].astype(float))
+        + np.square(family_delta_df["wt_rmsf_std"].astype(float))
+    )
+    family_delta_df["standardized_delta_rmsf"] = np.where(
+        pooled_sd > 0.0,
+        family_delta_df["delta_rmsf"].astype(float) / pooled_sd,
+        np.nan,
+    )
+    interest_df = (
+        family_delta_df.groupby(["family", "resid", "resname"], as_index=False)
+        .agg(
+            mean_delta_rmsf=("delta_rmsf", "mean"),
+            mean_abs_delta_rmsf=("delta_rmsf", lambda values: np.mean(np.abs(values))),
+            max_abs_delta_rmsf=("delta_rmsf", lambda values: np.max(np.abs(values))),
+            mean_abs_standardized_delta_rmsf=(
+                "standardized_delta_rmsf",
+                lambda values: np.nanmean(np.abs(values)),
+            ),
+            n_variants=("variant_system", "nunique"),
+            fraction_variants_lower_than_wt=("delta_rmsf", lambda values: np.mean(np.asarray(values) < 0.0)),
+        )
+        .sort_values(
+            [
+                "mean_abs_delta_rmsf",
+                "mean_abs_standardized_delta_rmsf",
+                "max_abs_delta_rmsf",
+                "resid",
+            ],
+            ascending=[False, False, False, True],
+        )
+        .reset_index(drop=True)
+    )
+    interest_df["interest_rank"] = np.arange(1, len(interest_df) + 1, dtype=int)
+    return interest_df
+
+
+def compute_md_family_pair_interest_df(
+    pair_summary_df: pd.DataFrame,
+    metadata_df: pd.DataFrame,
+    family_id: str,
+) -> pd.DataFrame:
+    system_order = compute_md_variant_system_order(metadata_df, family_id)
+    family_pair_df = pair_summary_df.loc[pair_summary_df["system"].isin(system_order)].copy()
+    if family_pair_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "pair_label",
+                "max_abs_delta_vs_wt",
+                "mean_abs_delta_vs_wt",
+                "mean_delta_vs_wt",
+                "n_systems_present",
+                "interest_rank",
+            ]
+        )
+
+    pivot_df = family_pair_df.pivot(
+        index="pair_label",
+        columns="system",
+        values="occupancy_mean",
+    ).fillna(0.0)
+    pivot_df = pivot_df.reindex(columns=system_order, fill_value=0.0)
+    delta_to_wt_df = pivot_df.sub(pivot_df[system_order[0]], axis=0)
+
+    interest_df = pd.DataFrame(
+        {
+            "pair_label": delta_to_wt_df.index,
+            "max_abs_delta_vs_wt": delta_to_wt_df.abs().max(axis=1).to_numpy(dtype=float),
+            "mean_abs_delta_vs_wt": delta_to_wt_df.abs().mean(axis=1).to_numpy(dtype=float),
+            "mean_delta_vs_wt": delta_to_wt_df.mean(axis=1).to_numpy(dtype=float),
+            "n_systems_present": (pivot_df > 0.0).sum(axis=1).to_numpy(dtype=int),
+        }
+    ).sort_values(
+        ["max_abs_delta_vs_wt", "mean_abs_delta_vs_wt", "pair_label"],
+        ascending=[False, False, True],
+    ).reset_index(drop=True)
+    interest_df["interest_rank"] = np.arange(1, len(interest_df) + 1, dtype=int)
+    return interest_df
+
+
+def select_md_variant_top_variable_pairs(
+    family_id: str,
+    metadata_df: pd.DataFrame,
+    pair_summary_df: pd.DataFrame,
+    top_n: int = 25,
+) -> pd.DataFrame:
+    pair_interest_df = compute_md_family_pair_interest_df(
+        pair_summary_df=pair_summary_df,
+        metadata_df=metadata_df,
+        family_id=family_id,
+    )
+    top_pair_labels = pair_interest_df.head(top_n)["pair_label"].tolist()
+    return pair_summary_df.loc[pair_summary_df["pair_label"].isin(top_pair_labels)].copy()
+
+
+def compute_md_variant_signal_table(
+    metadata_df: pd.DataFrame,
+    local_residue_sets: dict[str, set[int]],
+    rmsf_delta_df: pd.DataFrame,
+    sasa_delta_df: pd.DataFrame,
+    ss_residue_delta_df: pd.DataFrame,
+    ss_counts_summary_df: pd.DataFrame,
+    pair_delta_by_metric: dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    metric_alias_map = {
+        "residue_contact_pairs": "contact",
+        "saltbridge_pairs": "saltbridge",
+        "hbond_pairs": "hbond",
+    }
+    signal_rows = []
+
+    for row in metadata_df.loc[~metadata_df["is_wildtype"]].itertuples(index=False):
+        family_id = str(row.family)
+        variant_system = str(row.system)
+        wildtype_system = str(row.wt_system)
+        local_resids = local_residue_sets.get(variant_system, set())
+        mutation_resids = set(int(value) for value in row.mutation_resids_list)
+
+        rmsf_variant_df = rmsf_delta_df.loc[
+            rmsf_delta_df["variant_system"].eq(variant_system)
+        ].copy()
+        sasa_variant_df = sasa_delta_df.loc[
+            sasa_delta_df["variant_system"].eq(variant_system)
+        ].copy()
+        ss_variant_df = ss_residue_delta_df.loc[
+            ss_residue_delta_df["variant_system"].eq(variant_system)
+        ].copy()
+        ss_variant_summary = ss_counts_summary_df.loc[
+            ss_counts_summary_df["system"].eq(variant_system)
+        ].iloc[0]
+        ss_wildtype_summary = ss_counts_summary_df.loc[
+            ss_counts_summary_df["system"].eq(wildtype_system)
+        ].iloc[0]
+
+        rmsf_local = rmsf_variant_df.loc[
+            rmsf_variant_df["resid"].isin(local_resids),
+            "delta_rmsf",
+        ]
+        sasa_local = sasa_variant_df.loc[
+            sasa_variant_df["resid"].isin(local_resids),
+            "delta_mean_sasa",
+        ]
+        ss_local = ss_variant_df.loc[
+            ss_variant_df["resid"].isin(local_resids),
+            "delta_ordered_occupancy",
+        ]
+        rmsf_mutation = rmsf_variant_df.loc[
+            rmsf_variant_df["resid"].isin(mutation_resids),
+            "delta_rmsf",
+        ]
+        sasa_mutation = sasa_variant_df.loc[
+            sasa_variant_df["resid"].isin(mutation_resids),
+            "delta_mean_sasa",
+        ]
+
+        signal_row = {
+            "family": family_id,
+            "variant_system": variant_system,
+            "variant_label": get_md_variant_display_label_from_row(row),
+            "wt_system": wildtype_system,
+            "mutation_count": int(row.mutation_count),
+            "neighborhood_residue_count": len(local_resids),
+            "median_tm_celsius": float(getattr(row, "median_tm_celsius", np.nan))
+            if pd.notna(getattr(row, "median_tm_celsius", np.nan))
+            else np.nan,
+            "wildtype_median_tm_celsius": float(getattr(row, "wildtype_median_tm_celsius", np.nan))
+            if pd.notna(getattr(row, "wildtype_median_tm_celsius", np.nan))
+            else np.nan,
+            "delta_tm_to_wildtype_celsius": float(getattr(row, "delta_tm_to_wildtype_celsius", np.nan))
+            if pd.notna(getattr(row, "delta_tm_to_wildtype_celsius", np.nan))
+            else np.nan,
+            "delta_rmsf_global_mean": float(rmsf_variant_df["delta_rmsf"].mean()),
+            "delta_rmsf_neighborhood_mean": float(rmsf_local.mean()) if len(rmsf_local) else np.nan,
+            "delta_rmsf_mutation_mean": float(rmsf_mutation.mean()) if len(rmsf_mutation) else np.nan,
+            "delta_sasa_global_mean": float(sasa_variant_df["delta_mean_sasa"].mean()),
+            "delta_sasa_neighborhood_mean": float(sasa_local.mean()) if len(sasa_local) else np.nan,
+            "delta_sasa_mutation_mean": float(sasa_mutation.mean()) if len(sasa_mutation) else np.nan,
+            "delta_ordered_ss_global_mean": float(ss_variant_df["delta_ordered_occupancy"].mean()),
+            "delta_ordered_ss_neighborhood_mean": float(ss_local.mean()) if len(ss_local) else np.nan,
+            "delta_helix_fraction_global": float(
+                ss_variant_summary["helix_fraction_mean"] - ss_wildtype_summary["helix_fraction_mean"]
+            ),
+            "delta_strand_fraction_global": float(
+                ss_variant_summary["strand_fraction_mean"] - ss_wildtype_summary["strand_fraction_mean"]
+            ),
+            "delta_ordered_fraction_global": float(
+                ss_variant_summary["ordered_fraction_mean"] - ss_wildtype_summary["ordered_fraction_mean"]
+            ),
+        }
+
+        for metric_name, delta_df in pair_delta_by_metric.items():
+            metric_base_name = metric_alias_map[metric_name]
+            variant_pair_df = delta_df.loc[
+                delta_df["variant_system"].eq(variant_system)
+            ].copy()
+            local_pair_df = variant_pair_df.loc[variant_pair_df["is_local_pair"]]
+
+            signal_row[f"{metric_base_name}_gain_total"] = float(
+                variant_pair_df["delta_occupancy"].clip(lower=0.0).sum()
+            )
+            signal_row[f"{metric_base_name}_loss_total"] = float(
+                (-variant_pair_df["delta_occupancy"].clip(upper=0.0)).sum()
+            )
+            signal_row[f"{metric_base_name}_gain_local"] = float(
+                local_pair_df["delta_occupancy"].clip(lower=0.0).sum()
+            )
+            signal_row[f"{metric_base_name}_loss_local"] = float(
+                (-local_pair_df["delta_occupancy"].clip(upper=0.0)).sum()
+            )
+            total_gain = signal_row[f"{metric_base_name}_gain_total"]
+            signal_row[f"{metric_base_name}_gain_local_fraction"] = (
+                signal_row[f"{metric_base_name}_gain_local"] / total_gain
+                if total_gain > 0
+                else 0.0
+            )
+
+        signal_rows.append(signal_row)
+
+    signal_df = pd.DataFrame(signal_rows)
+    if signal_df.empty:
+        return signal_df
+
+    signal_df["rmsf_neighborhood_gain"] = -signal_df["delta_rmsf_neighborhood_mean"]
+    signal_df["sasa_neighborhood_gain"] = -signal_df["delta_sasa_neighborhood_mean"]
+    signal_df["ordered_ss_neighborhood_gain"] = signal_df["delta_ordered_ss_neighborhood_mean"]
+
+    for column_name in MD_VARIANT_SIGNAL_COLUMNS:
+        signal_df[f"{column_name}_rank"] = signal_df[column_name].rank(
+            method="average",
+            pct=True,
+        )
+
+    signal_df["composite_stabilizing_score"] = signal_df[
+        [f"{column_name}_rank" for column_name in MD_VARIANT_SIGNAL_COLUMNS]
+    ].mean(axis=1)
+    signal_df["global_rank"] = signal_df["composite_stabilizing_score"].rank(
+        method="dense",
+        ascending=False,
+    )
+    signal_df["family_rank"] = signal_df.groupby("family")[
+        "composite_stabilizing_score"
+    ].rank(
+        method="dense",
+        ascending=False,
+    )
+    return signal_df.sort_values(
+        ["global_rank", "family", "variant_system"],
+        ascending=[True, True, True],
+    ).reset_index(drop=True)
+
+
+def build_md_variant_family_pattern_summary(
+    variant_signal_df: pd.DataFrame,
+) -> pd.DataFrame:
+    if variant_signal_df.empty:
+        return pd.DataFrame()
+
+    family_rows = []
+    for family_id, family_df in variant_signal_df.groupby("family"):
+        family_rows.append(
+            {
+                "family": family_id,
+                "n_variants": int(len(family_df)),
+                "fraction_lower_local_rmsf": float((family_df["delta_rmsf_neighborhood_mean"] < 0.0).mean()),
+                "fraction_lower_local_sasa": float((family_df["delta_sasa_neighborhood_mean"] < 0.0).mean()),
+                "fraction_higher_local_ss": float((family_df["delta_ordered_ss_neighborhood_mean"] > 0.0).mean()),
+                "fraction_contact_gain": float((family_df["contact_gain_total"] > 0.0).mean()),
+                "fraction_saltbridge_gain": float((family_df["saltbridge_gain_total"] > 0.0).mean()),
+                "fraction_hbond_gain": float((family_df["hbond_gain_total"] > 0.0).mean()),
+                "median_composite_score": float(family_df["composite_stabilizing_score"].median()),
+                "median_contact_local_fraction": float(family_df["contact_gain_local_fraction"].median()),
+                "median_hbond_local_fraction": float(family_df["hbond_gain_local_fraction"].median()),
+            }
+        )
+
+    family_rows.append(
+        {
+            "family": "ALL",
+            "n_variants": int(len(variant_signal_df)),
+            "fraction_lower_local_rmsf": float((variant_signal_df["delta_rmsf_neighborhood_mean"] < 0.0).mean()),
+            "fraction_lower_local_sasa": float((variant_signal_df["delta_sasa_neighborhood_mean"] < 0.0).mean()),
+            "fraction_higher_local_ss": float((variant_signal_df["delta_ordered_ss_neighborhood_mean"] > 0.0).mean()),
+            "fraction_contact_gain": float((variant_signal_df["contact_gain_total"] > 0.0).mean()),
+            "fraction_saltbridge_gain": float((variant_signal_df["saltbridge_gain_total"] > 0.0).mean()),
+            "fraction_hbond_gain": float((variant_signal_df["hbond_gain_total"] > 0.0).mean()),
+            "median_composite_score": float(variant_signal_df["composite_stabilizing_score"].median()),
+            "median_contact_local_fraction": float(variant_signal_df["contact_gain_local_fraction"].median()),
+            "median_hbond_local_fraction": float(variant_signal_df["hbond_gain_local_fraction"].median()),
+        }
+    )
+
+    return pd.DataFrame(family_rows)
+
+
+def build_md_variant_analysis_bundle(
+    metric_dir: Path,
+    mutation_metadata_path: Path,
+    metric_window: str | int | None = "latest",
+    tm_summary_df: pd.DataFrame | None = None,
+) -> MDVariantAnalysisBundle:
+    required_metrics = [
+        "rmsf",
+        "residue_sasa",
+        "secondary_structure_counts",
+        "secondary_structure_residue",
+        "mutation_neighborhood",
+        *MD_VARIANT_INTERACTION_COUNT_METRICS,
+        *MD_VARIANT_PAIR_METRICS,
+    ]
+    metric_window_suffix = resolve_md_variant_metric_window_suffix(
+        metric_dir=metric_dir,
+        required_metrics=required_metrics,
+        metric_window=metric_window,
+    )
+    metric_window_start, metric_window_stop = parse_md_variant_metric_window_suffix(
+        metric_window_suffix
+    )
+
+    metadata_df = load_md_variant_metadata(
+        mutation_metadata_path=mutation_metadata_path,
+    )
+    metadata_df = annotate_md_variant_metadata_with_tm(
+        metadata_df=metadata_df,
+        tm_summary_df=tm_summary_df,
+    )
+    family_ids = order_md_variant_families(metadata_df)
+
+    rmsf_raw_df = read_md_variant_metric_table(
+        metric_dir, "rmsf", metric_window_suffix=metric_window_suffix
+    )
+    sasa_raw_df = read_md_variant_metric_table(
+        metric_dir, "residue_sasa", metric_window_suffix=metric_window_suffix
+    )
+    ss_counts_raw_df = read_md_variant_metric_table(
+        metric_dir,
+        "secondary_structure_counts",
+        metric_window_suffix=metric_window_suffix,
+    )
+    ss_residue_raw_df = read_md_variant_metric_table(
+        metric_dir,
+        "secondary_structure_residue",
+        metric_window_suffix=metric_window_suffix,
+    )
+    mutation_neighborhood_df = read_md_variant_metric_table(
+        metric_dir,
+        "mutation_neighborhood",
+        metric_window_suffix=metric_window_suffix,
+    )
+    interaction_count_raw_by_metric = {
+        metric_name: read_md_variant_metric_table(
+            metric_dir,
+            metric_name,
+            metric_window_suffix=metric_window_suffix,
+        )
+        for metric_name in MD_VARIANT_INTERACTION_COUNT_METRICS
+    }
+    rmsf_raw_df = backfill_md_variant_rmsf_resnames(
+        rmsf_df=rmsf_raw_df,
+        residue_reference_df=sasa_raw_df,
+    )
+    pair_raw_by_metric = {
+        metric_name: prepare_md_variant_pair_metric(
+            read_md_variant_metric_table(
+                metric_dir,
+                metric_name,
+                metric_window_suffix=metric_window_suffix,
+            ),
+            metric_name=metric_name,
+        )
+        for metric_name in MD_VARIANT_PAIR_METRICS
+    }
+    replicate_count_by_system = compute_md_variant_replicate_counts(rmsf_raw_df)
+
+    local_residue_sets = load_md_variant_local_residue_sets(
+        metadata_df=metadata_df,
+        rmsf_raw_df=rmsf_raw_df,
+        mutation_neighborhood_df=mutation_neighborhood_df,
+    )
+
+    ss_residue_raw_df["ordered_occupancy"] = (
+        ss_residue_raw_df["helix_occupancy"] + ss_residue_raw_df["strand_occupancy"]
+    )
+
+    rmsf_summary_df = aggregate_md_variant_residue_metric(rmsf_raw_df, ["rmsf"])
+    sasa_summary_df = aggregate_md_variant_residue_metric(sasa_raw_df, ["mean_sasa"])
+    global_sasa_replicate_df = compute_md_variant_global_sasa_replicate_table(sasa_raw_df).merge(
+        metadata_df[
+            [
+                "system",
+                "family",
+                "is_wildtype",
+                "mutation_count",
+                "short_label",
+                "tm_display_label",
+            ]
+        ],
+        on="system",
+        how="left",
+        validate="many_to_one",
+    )
+    ss_residue_summary_df = aggregate_md_variant_residue_metric(
+        ss_residue_raw_df,
+        ["helix_occupancy", "strand_occupancy", "loop_occupancy", "ordered_occupancy"],
+    )
+    ss_counts_summary_df = aggregate_md_variant_secondary_structure_counts(ss_counts_raw_df)
+    interaction_count_summary_by_metric = {
+        metric_name: aggregate_md_variant_interaction_count_metric(
+            metric_df,
+            value_column=MD_VARIANT_INTERACTION_COUNT_COLUMN_MAP[metric_name],
+        )
+        for metric_name, metric_df in interaction_count_raw_by_metric.items()
+    }
+    interaction_count_replicate_by_metric = {
+        metric_name: compute_md_variant_interaction_count_replicate_table(
+            metric_df,
+            value_column=MD_VARIANT_INTERACTION_COUNT_COLUMN_MAP[metric_name],
+        ).merge(
+            metadata_df[
+                [
+                    "system",
+                    "family",
+                    "is_wildtype",
+                    "mutation_count",
+                    "short_label",
+                    "tm_display_label",
+                ]
+            ],
+            on="system",
+            how="left",
+            validate="many_to_one",
+        )
+        for metric_name, metric_df in interaction_count_raw_by_metric.items()
+    }
+    interaction_count_block_by_metric = {
+        metric_name: compute_md_variant_interaction_count_block_table(
+            metric_df,
+            value_column=MD_VARIANT_INTERACTION_COUNT_COLUMN_MAP[metric_name],
+        ).merge(
+            metadata_df[
+                [
+                    "system",
+                    "family",
+                    "is_wildtype",
+                    "mutation_count",
+                    "short_label",
+                    "tm_display_label",
+                ]
+            ],
+            on="system",
+            how="left",
+            validate="many_to_one",
+        )
+        for metric_name, metric_df in interaction_count_raw_by_metric.items()
+    }
+    pair_summary_by_metric = {
+        metric_name: aggregate_md_variant_pair_metric(
+            metric_df,
+            replicate_count_by_system=replicate_count_by_system,
+        )
+        for metric_name, metric_df in pair_raw_by_metric.items()
+    }
+
+    rmsf_delta_tables = []
+    sasa_delta_tables = []
+    ss_delta_tables = []
+    interaction_count_delta_tables_by_metric = {
+        metric_name: []
+        for metric_name in MD_VARIANT_INTERACTION_COUNT_METRICS
+    }
+    pair_delta_tables_by_metric = {
+        metric_name: []
+        for metric_name in MD_VARIANT_PAIR_METRICS
+    }
+    for family_id in family_ids:
+        rmsf_delta_tables.append(
+            compute_md_variant_residue_delta_table(
+                summary_df=rmsf_summary_df,
+                metadata_df=metadata_df,
+                family_id=family_id,
+                value_columns=["rmsf"],
+            )
+        )
+        sasa_delta_tables.append(
+            compute_md_variant_residue_delta_table(
+                summary_df=sasa_summary_df,
+                metadata_df=metadata_df,
+                family_id=family_id,
+                value_columns=["mean_sasa"],
+            )
+        )
+        ss_delta_tables.append(
+            compute_md_variant_residue_delta_table(
+                summary_df=ss_residue_summary_df,
+                metadata_df=metadata_df,
+                family_id=family_id,
+                value_columns=[
+                    "helix_occupancy",
+                    "strand_occupancy",
+                    "loop_occupancy",
+                    "ordered_occupancy",
+                ],
+            )
+        )
+        for metric_name, interaction_count_summary_df in interaction_count_summary_by_metric.items():
+            interaction_count_delta_tables_by_metric[metric_name].append(
+                compute_md_variant_frame_delta_table(
+                    summary_df=interaction_count_summary_df,
+                    metadata_df=metadata_df,
+                    family_id=family_id,
+                )
+            )
+        for metric_name, pair_summary_df in pair_summary_by_metric.items():
+            pair_delta_tables_by_metric[metric_name].append(
+                compute_md_variant_pair_delta_table(
+                    summary_df=pair_summary_df,
+                    metadata_df=metadata_df,
+                    family_id=family_id,
+                    local_residue_sets=local_residue_sets,
+                )
+            )
+
+    rmsf_delta_df = pd.concat(rmsf_delta_tables, ignore_index=True)
+    sasa_delta_df = pd.concat(sasa_delta_tables, ignore_index=True)
+    ss_residue_delta_df = pd.concat(ss_delta_tables, ignore_index=True)
+    interaction_count_delta_by_metric = {
+        metric_name: pd.concat(metric_tables, ignore_index=True)
+        for metric_name, metric_tables in interaction_count_delta_tables_by_metric.items()
+    }
+    pair_delta_by_metric = {
+        metric_name: pd.concat(metric_tables, ignore_index=True)
+        for metric_name, metric_tables in pair_delta_tables_by_metric.items()
+    }
+
+    variant_signal_df = compute_md_variant_signal_table(
+        metadata_df=metadata_df,
+        local_residue_sets=local_residue_sets,
+        rmsf_delta_df=rmsf_delta_df,
+        sasa_delta_df=sasa_delta_df,
+        ss_residue_delta_df=ss_residue_delta_df,
+        ss_counts_summary_df=ss_counts_summary_df,
+        pair_delta_by_metric=pair_delta_by_metric,
+    )
+    family_pattern_summary_df = build_md_variant_family_pattern_summary(
+        variant_signal_df=variant_signal_df
+    )
+
+    return MDVariantAnalysisBundle(
+        metric_window_suffix=metric_window_suffix,
+        metric_window_start=metric_window_start,
+        metric_window_stop=metric_window_stop,
+        metadata_df=metadata_df,
+        replicate_count_by_system=replicate_count_by_system,
+        local_residue_sets=local_residue_sets,
+        family_ids=family_ids,
+        rmsf_summary_df=rmsf_summary_df,
+        sasa_summary_df=sasa_summary_df,
+        ss_counts_summary_df=ss_counts_summary_df,
+        ss_residue_summary_df=ss_residue_summary_df,
+        interaction_count_summary_by_metric=interaction_count_summary_by_metric,
+        interaction_count_replicate_by_metric=interaction_count_replicate_by_metric,
+        interaction_count_block_by_metric=interaction_count_block_by_metric,
+        global_sasa_replicate_df=global_sasa_replicate_df,
+        pair_summary_by_metric=pair_summary_by_metric,
+        rmsf_delta_df=rmsf_delta_df,
+        sasa_delta_df=sasa_delta_df,
+        ss_residue_delta_df=ss_residue_delta_df,
+        interaction_count_delta_by_metric=interaction_count_delta_by_metric,
+        pair_delta_by_metric=pair_delta_by_metric,
+        variant_signal_df=variant_signal_df,
+        family_pattern_summary_df=family_pattern_summary_df,
+    )
+
+
+def build_md_variant_local_signal_plot_table(
+    variant_signal_df: pd.DataFrame,
+    metadata_df: pd.DataFrame,
+    family_id: str,
+) -> pd.DataFrame:
+    family_df = variant_signal_df.loc[variant_signal_df["family"].eq(family_id)].copy()
+    family_df["variant_system"] = pd.Categorical(
+        family_df["variant_system"],
+        categories=compute_md_variant_order(metadata_df, family_id),
+        ordered=True,
+    )
+    table_df = family_df[
+        [
+            "variant_system",
+            "variant_label",
+            "delta_rmsf_neighborhood_mean",
+            "delta_sasa_neighborhood_mean",
+            "delta_ordered_ss_neighborhood_mean",
+            "contact_gain_local",
+            "saltbridge_gain_local",
+            "hbond_gain_local",
+            "contact_gain_local_fraction",
+            "hbond_gain_local_fraction",
+        ]
+    ].copy()
+    table_df = table_df.sort_values("variant_system")
+    zscore_columns = [
+        column_name
+        for column_name in table_df.columns
+        if column_name not in {"variant_system", "variant_label"}
+    ]
+    for column_name in zscore_columns:
+        values = table_df[column_name].astype(float)
+        if float(values.std(ddof=0)) > 0:
+            table_df[column_name] = (values - values.mean()) / values.std(ddof=0)
+        else:
+            table_df[column_name] = 0.0
+    return table_df
+
+
+def plot_md_family_rmsf_panels(
+    family_id: str,
+    metadata_df: pd.DataFrame,
+    rmsf_summary_df: pd.DataFrame,
+):
+    family_metadata_df = metadata_df.loc[metadata_df["family"].eq(family_id)].copy()
+    wildtype_system = family_metadata_df.loc[family_metadata_df["is_wildtype"], "system"].iat[0]
+    wildtype_df = rmsf_summary_df.loc[rmsf_summary_df["system"].eq(wildtype_system)].sort_values("resid").copy()
+    variant_order = compute_md_variant_order(metadata_df, family_id)
+    color_map = build_md_variant_family_color_map(metadata_df, family_id)
+
+    n_variants = len(variant_order)
+    n_columns = 2 if n_variants > 1 else 1
+    n_rows = int(np.ceil(n_variants / n_columns))
+    figure, axes = plt.subplots(
+        n_rows,
+        n_columns,
+        figsize=(12, max(4.0, 3.5 * n_rows + 1.1)),
+        sharex=True,
+        sharey=True,
+        constrained_layout=True,
+    )
+    figure.set_constrained_layout_pads(hspace=0.08, h_pad=0.08, w_pad=0.04)
+    axes = np.atleast_1d(axes).ravel()
+
+    y_max = max(
+        float((wildtype_df["rmsf_mean"] + wildtype_df["rmsf_std"]).max()),
+        float(
+            rmsf_summary_df.loc[
+                rmsf_summary_df["system"].isin(variant_order),
+                "rmsf_mean",
+            ].max()
+        ),
+    )
+    residue_ticks = choose_residue_ticks(wildtype_df["resid"].to_numpy(dtype=int))
+
+    for axis, variant_system in zip(axes, variant_order):
+        variant_df = rmsf_summary_df.loc[
+            rmsf_summary_df["system"].eq(variant_system)
+        ].sort_values("resid").copy()
+        variant_metadata = family_metadata_df.loc[
+            family_metadata_df["system"].eq(variant_system)
+        ].iloc[0]
+        mutation_resids = list(variant_metadata["mutation_resids_list"])
+
+        axis.fill_between(
+            wildtype_df["resid"],
+            wildtype_df["rmsf_mean"] - wildtype_df["rmsf_std"],
+            wildtype_df["rmsf_mean"] + wildtype_df["rmsf_std"],
+            color="#bdbdbd",
+            alpha=0.35,
+            label="WT replicate SD",
+        )
+        axis.plot(
+            wildtype_df["resid"],
+            wildtype_df["rmsf_mean"],
+            color="#222222",
+            linewidth=2.0,
+            label="WT mean",
+        )
+        axis.plot(
+            variant_df["resid"],
+            variant_df["rmsf_mean"],
+            color=color_map[variant_system],
+            linewidth=1.8,
+            label="Variant mean",
+        )
+        axis.fill_between(
+            variant_df["resid"],
+            variant_df["rmsf_mean"] - variant_df["rmsf_std"],
+            variant_df["rmsf_mean"] + variant_df["rmsf_std"],
+            color=color_map[variant_system],
+            alpha=0.15,
+        )
+
+        if mutation_resids:
+            axis.scatter(
+                mutation_resids,
+                np.full(len(mutation_resids), -0.06 * y_max),
+                marker="v",
+                s=18,
+                color=color_map[variant_system],
+                edgecolors="none",
+                clip_on=False,
+                zorder=4,
+            )
+
+        axis.set_ylim(-0.08 * y_max, 1.05 * y_max)
+        axis.set_xticks(residue_ticks)
+        axis.set_title(
+            build_md_family_rmsf_panel_title(variant_metadata),
+            fontsize=9,
+            pad=10,
+        )
+        axis.grid(alpha=0.18, linewidth=0.5)
+
+    for axis in axes[n_variants:]:
+        axis.set_visible(False)
+
+    legend_handles = [
+        plt.Line2D([0], [0], color="#222222", linewidth=2.0, label="WT mean"),
+        plt.Rectangle((0, 0), 1, 1, color="#bdbdbd", alpha=0.35, label="WT replicate SD"),
+        plt.Line2D([0], [0], color="#1f77b4", linewidth=1.8, label="Variant mean"),
+        plt.Line2D([0], [0], marker="v", linestyle="None", color="#1f77b4", markersize=6, label="Mutation site"),
+    ]
+    figure.legend(
+        handles=legend_handles,
+        loc="upper center",
+        ncol=4,
+        frameon=False,
+        bbox_to_anchor=(0.5, 1.02),
+    )
+    figure.suptitle(
+        f"{family_id}: per-variant RMSF vs WT\nNegative local shifts in the companion heatmap indicate reduced flexibility relative to WT.",
+        fontsize=13,
+        y=1.05,
+    )
+    figure.supxlabel("Residue number")
+    figure.supylabel("RMSF")
+    return figure
+
+
+def plot_md_family_delta_heatmap(
+    family_id: str,
+    metadata_df: pd.DataFrame,
+    delta_df: pd.DataFrame,
+    value_column: str,
+    title: str,
+    colorbar_label: str,
+    vlim: float | None = None,
+):
+    variant_order = compute_md_variant_order(metadata_df, family_id)
+    family_delta_df = delta_df.loc[delta_df["family"].eq(family_id)].copy()
+    family_delta_df["variant_system"] = pd.Categorical(
+        family_delta_df["variant_system"],
+        categories=variant_order,
+        ordered=True,
+    )
+    family_delta_df = family_delta_df.sort_values(["variant_system", "resid"])
+    pivot_df = family_delta_df.pivot(
+        index="variant_system",
+        columns="resid",
+        values=value_column,
+    ).loc[variant_order]
+
+    residue_numbers = pivot_df.columns.to_numpy(dtype=int)
+    tick_values = choose_residue_ticks(residue_numbers)
+    tick_positions = [
+        int(np.where(residue_numbers == tick_value)[0][0])
+        for tick_value in tick_values
+        if tick_value in residue_numbers
+    ]
+    row_labels = [
+        get_md_variant_display_label(metadata_df, system_name)
+        for system_name in pivot_df.index
+    ]
+    max_abs_value = float(np.nanmax(np.abs(pivot_df.to_numpy(dtype=float))))
+    heatmap_limit = vlim if vlim is not None else max(max_abs_value, 1e-6)
+
+    figure, axis = plt.subplots(
+        figsize=(15, max(3.2, 0.42 * len(variant_order) + 1.8)),
+        constrained_layout=True,
+    )
+    image = axis.imshow(
+        pivot_df.to_numpy(dtype=float),
+        aspect="auto",
+        cmap=MD_VARIANT_DELTA_CMAP,
+        norm=TwoSlopeNorm(vmin=-heatmap_limit, vcenter=0.0, vmax=heatmap_limit),
+    )
+    axis.set_yticks(np.arange(len(row_labels)))
+    axis.set_yticklabels(row_labels)
+    axis.set_xticks(tick_positions)
+    axis.set_xticklabels(tick_values)
+    axis.set_xlabel("Residue number")
+    axis.set_ylabel("Variant")
+    axis.set_title(title)
+
+    for row_index, variant_system in enumerate(variant_order):
+        mutation_resids = metadata_df.loc[
+            metadata_df["system"].eq(variant_system),
+            "mutation_resids_list",
+        ].iat[0]
+        mutation_positions = [
+            int(np.where(residue_numbers == residue_number)[0][0])
+            for residue_number in mutation_resids
+            if residue_number in residue_numbers
+        ]
+        if mutation_positions:
+            axis.scatter(
+                mutation_positions,
+                np.full(len(mutation_positions), row_index),
+                marker="s",
+                s=12,
+                color="black",
+                linewidths=0,
+            )
+
+    colorbar = figure.colorbar(image, ax=axis, fraction=0.026, pad=0.02)
+    colorbar.set_label(colorbar_label)
+    return figure
+
+
+def plot_md_family_pair_heatmaps(
+    family_id: str,
+    metadata_df: pd.DataFrame,
+    pair_summary_by_metric: dict[str, pd.DataFrame],
+):
+    system_order = compute_md_variant_system_order(metadata_df, family_id)
+    figure, axes = plt.subplots(1, 3, figsize=(20, 7), constrained_layout=True)
+
+    for axis, metric_name in zip(axes, MD_VARIANT_PAIR_METRICS):
+        selected_df = select_md_variant_top_variable_pairs(
+            family_id=family_id,
+            metadata_df=metadata_df,
+            pair_summary_df=pair_summary_by_metric[metric_name],
+            top_n=25,
+        )
+        pivot_df = selected_df.pivot(
+            index="pair_label",
+            columns="system",
+            values="occupancy_mean",
+        ).fillna(0.0)
+        pivot_df = pivot_df.reindex(columns=system_order)
+        row_order = (
+            pivot_df.sub(pivot_df[system_order[0]], axis=0)
+            .abs()
+            .max(axis=1)
+            .sort_values(ascending=False)
+            .index.tolist()
+        )
+        pivot_df = pivot_df.loc[row_order]
+        column_labels = [
+            get_md_variant_display_label(metadata_df, system_name)
+            for system_name in pivot_df.columns
+        ]
+
+        image = axis.imshow(
+            pivot_df.to_numpy(dtype=float),
+            aspect="auto",
+            cmap=MD_VARIANT_OCCUPANCY_CMAP,
+            vmin=0.0,
+            vmax=1.0,
+        )
+        axis.set_xticks(np.arange(len(column_labels)))
+        axis.set_xticklabels(column_labels, rotation=45, ha="right")
+        axis.set_yticks(np.arange(len(pivot_df.index)))
+        axis.set_yticklabels(
+            [wrap_md_variant_label(label, width=18) for label in pivot_df.index],
+            fontsize=8,
+        )
+        axis.set_title(
+            {
+                "residue_contact_pairs": "Residue contacts",
+                "saltbridge_pairs": "Salt bridges",
+                "hbond_pairs": "Hydrogen bonds",
+            }[metric_name]
+        )
+        axis.set_xlabel("System")
+        if axis is axes[0]:
+            axis.set_ylabel("Top variable residue pairs")
+
+    colorbar = figure.colorbar(image, ax=axes, fraction=0.02, pad=0.01)
+    colorbar.set_label("Mean occupancy across replicates")
+    figure.suptitle(
+        f"{family_id}: occupancy heatmaps for the most WT-divergent interaction pairs\n"
+        "Rows are ranked by the largest absolute occupancy shift to WT across variants in this family.",
+        fontsize=13,
+    )
+    return figure
+
+
+def plot_md_family_interaction_count_trajectories(
+    family_id: str,
+    metadata_df: pd.DataFrame,
+    interaction_count_summary_by_metric: dict[str, pd.DataFrame],
+    interaction_count_delta_by_metric: dict[str, pd.DataFrame],
+):
+    variant_order = compute_md_variant_order(metadata_df, family_id)
+    family_metadata_df = metadata_df.loc[metadata_df["family"].eq(family_id)].copy()
+    wildtype_system = family_metadata_df.loc[
+        family_metadata_df["is_wildtype"],
+        "system",
+    ].iat[0]
+    color_map = build_md_variant_family_color_map(metadata_df, family_id)
+
+    figure, axes = plt.subplots(
+        len(MD_VARIANT_INTERACTION_COUNT_METRICS),
+        1,
+        figsize=(14, 8.8),
+        sharex=True,
+        constrained_layout=True,
+    )
+    axes = np.atleast_1d(axes).ravel()
+
+    legend_handles = [
+        plt.Line2D([0], [0], color="#222222", linewidth=1.2, label="WT mean (0 delta)"),
+        plt.Rectangle((0, 0), 1, 1, color="#bdbdbd", alpha=0.3, label="WT replicate SD"),
+    ]
+
+    for axis_index, (axis, metric_name) in enumerate(
+        zip(axes, MD_VARIANT_INTERACTION_COUNT_METRICS)
+    ):
+        summary_df = interaction_count_summary_by_metric[metric_name]
+        delta_df = interaction_count_delta_by_metric[metric_name]
+        wt_df = summary_df.loc[summary_df["system"].eq(wildtype_system)].sort_values("frame").copy()
+        family_delta_df = delta_df.loc[delta_df["family"].eq(family_id)].copy()
+
+        axis.fill_between(
+            wt_df["time_ns"],
+            -wt_df["count_std"],
+            wt_df["count_std"],
+            color="#bdbdbd",
+            alpha=0.3,
+            linewidth=0.0,
+        )
+        axis.axhline(0.0, color="#222222", linewidth=1.2)
+
+        max_abs_delta = float(np.nanmax(np.abs(family_delta_df["delta_count"]))) if not family_delta_df.empty else 0.0
+        max_abs_wt_std = float(np.nanmax(wt_df["count_std"])) if not wt_df.empty else 0.0
+        y_limit = max(max_abs_delta, max_abs_wt_std, 1e-6) * 1.08
+
+        for variant_system in variant_order:
+            variant_df = family_delta_df.loc[
+                family_delta_df["variant_system"].eq(variant_system)
+            ].sort_values("frame").copy()
+            if variant_df.empty:
+                continue
+
+            variant_label = metadata_df.loc[
+                metadata_df["system"].eq(variant_system),
+                "short_label",
+            ].iat[0]
+            axis.plot(
+                variant_df["time_ns"],
+                variant_df["delta_count"],
+                color=color_map[variant_system],
+                linewidth=1.3,
+                alpha=0.95,
+                label=variant_label if axis_index == 0 else None,
+            )
+            if axis_index == 0:
+                legend_handles.append(
+                    plt.Line2D(
+                        [0],
+                        [0],
+                        color=color_map[variant_system],
+                        linewidth=1.3,
+                        label=variant_label,
+                    )
+                )
+
+        axis.set_ylim(-y_limit, y_limit)
+        axis.set_ylabel("Delta count")
+        axis.set_title(
+            f"{MD_VARIANT_INTERACTION_COUNT_LABEL_MAP[metric_name]}\n"
+            "Variant mean count - WT mean count per frame",
+            fontsize=11,
+        )
+        axis.grid(axis="y", alpha=0.18, linewidth=0.5)
+
+    axes[-1].set_xlabel("Trajectory time (ns)")
+    figure.legend(
+        handles=legend_handles,
+        loc="upper center",
+        ncol=min(4, len(legend_handles)),
+        frameon=False,
+        bbox_to_anchor=(0.5, 1.02),
+    )
+    figure.suptitle(
+        f"{family_id}: interaction-count trajectories relative to WT\n"
+        "Zero marks the WT mean trajectory at each timepoint; the gray band shows WT replicate SD.",
+        fontsize=13,
+        y=1.05,
+    )
+    return figure
+
+
+def plot_md_family_absolute_metric_boxplots(
+    family_id: str,
+    metadata_df: pd.DataFrame,
+    interaction_count_summary_by_metric: dict[str, pd.DataFrame],
+    interaction_count_block_by_metric: dict[str, pd.DataFrame],
+    interaction_count_replicate_by_metric: dict[str, pd.DataFrame],
+    global_sasa_replicate_df: pd.DataFrame,
+    significance_df: pd.DataFrame | None = None,
+):
+    system_order = compute_md_variant_system_order(metadata_df, family_id)
+    family_metadata_df = metadata_df.loc[metadata_df["family"].eq(family_id)].copy()
+    wildtype_system = family_metadata_df.loc[
+        family_metadata_df["is_wildtype"],
+        "system",
+    ].iat[0]
+    color_map = build_md_variant_family_color_map(metadata_df, family_id)
+    if significance_df is None:
+        significance_df = compute_md_variant_absolute_metric_significance_df(
+            family_id=family_id,
+            metadata_df=metadata_df,
+            interaction_count_block_by_metric=interaction_count_block_by_metric,
+            interaction_count_replicate_by_metric=interaction_count_replicate_by_metric,
+            global_sasa_replicate_df=global_sasa_replicate_df,
+        )
+
+    positions = np.arange(1, len(system_order) + 1)
+    system_labels = [
+        "WT"
+        if system_name == wildtype_system
+        else metadata_df.loc[metadata_df["system"].eq(system_name), "short_label"].iat[0]
+        for system_name in system_order
+    ]
+
+    figure_height = max(4.8, 0.42 * len(system_order) + 2.6)
+    figure, axes = plt.subplots(
+        1,
+        4,
+        figsize=(18, figure_height),
+        sharey=False,
+        constrained_layout=False,
+    )
+    axes = np.atleast_1d(axes).ravel()
+
+    plot_specs = [
+        (
+            "residue_contacts",
+            MD_VARIANT_INTERACTION_COUNT_LABEL_MAP["residue_contacts"],
+            interaction_count_summary_by_metric["residue_contacts"],
+            "count_mean",
+            "Relative to WT median",
+        ),
+        (
+            "hbond_counts",
+            MD_VARIANT_INTERACTION_COUNT_LABEL_MAP["hbond_counts"],
+            interaction_count_summary_by_metric["hbond_counts"],
+            "count_mean",
+            "Relative to WT median",
+        ),
+        (
+            "saltbridge",
+            MD_VARIANT_INTERACTION_COUNT_LABEL_MAP["saltbridge"],
+            interaction_count_summary_by_metric["saltbridge"],
+            "count_mean",
+            "Relative to WT median",
+        ),
+        (
+            "global_sasa",
+            "Global SASA",
+            global_sasa_replicate_df.loc[
+                global_sasa_replicate_df["family"].eq(family_id)
+            ].copy(),
+            "global_mean_sasa",
+            "Relative to WT median",
+        ),
+    ]
+
+    for axis_index, (axis, metric_key, title, metric_df, value_column, xlabel) in enumerate(
+        (axis, *spec) for axis, spec in zip(axes, plot_specs)
+    ):
+        wildtype_values = (
+            metric_df.loc[metric_df["system"].eq(wildtype_system), value_column]
+            .astype(float)
+            .dropna()
+            .to_numpy()
+        )
+        wildtype_median = float(np.median(wildtype_values)) if wildtype_values.size else np.nan
+        values_by_system = []
+        for system_name in system_order:
+            system_values = (
+                metric_df.loc[metric_df["system"].eq(system_name), value_column]
+                .astype(float)
+                .dropna()
+                .to_numpy()
+            )
+            if np.isfinite(wildtype_median) and not np.isclose(wildtype_median, 0.0):
+                system_values = system_values / wildtype_median
+            if system_values.size == 0:
+                system_values = np.array([np.nan], dtype=float)
+            values_by_system.append(system_values)
+
+        boxplot = axis.boxplot(
+            values_by_system,
+            positions=positions,
+            vert=False,
+            patch_artist=True,
+            widths=0.68,
+            tick_labels=system_labels,
+            showfliers=False,
+            medianprops={"color": "#111111", "linewidth": 1.35},
+            whiskerprops={"color": "#555555", "linewidth": 1.0},
+            capprops={"color": "#555555", "linewidth": 1.0},
+            boxprops={"linewidth": 1.0},
+        )
+
+        for box_patch, system_name in zip(boxplot["boxes"], system_order):
+            if system_name == wildtype_system:
+                box_patch.set_facecolor("#d9d9d9")
+                box_patch.set_edgecolor("#222222")
+            else:
+                box_patch.set_facecolor(color_map[system_name])
+                box_patch.set_edgecolor("#222222")
+            box_patch.set_alpha(0.82)
+
+        if axis_index == 0:
+            axis.tick_params(axis="y", labelsize=9)
+            axis.set_ylabel("System")
+        else:
+            axis.tick_params(axis="y", labelleft=False)
+        axis.invert_yaxis()
+        axis.set_title(title, fontsize=11)
+        axis.set_xlabel(xlabel)
+        axis.grid(axis="x", alpha=0.22, linewidth=0.55)
+        axis.axvline(1.0, color="#666666", linewidth=1.0, linestyle="--", alpha=0.8, zorder=0)
+
+        metric_significance_df = significance_df.loc[
+            significance_df["metric_key"].eq(metric_key)
+            & significance_df["stars"].astype(str).ne("")
+        ].copy()
+        if not metric_significance_df.empty:
+            x_left, x_right = axis.get_xlim()
+            x_span = x_right - x_left
+            annotation_padding = 0.04 * x_span if np.isfinite(x_span) and x_span > 0 else 0.5
+            axis.set_xlim(x_left, x_right + 4.0 * annotation_padding)
+            star_by_system = metric_significance_df.set_index("system")["stars"].to_dict()
+            for position, system_name, system_values in zip(positions, system_order, values_by_system):
+                stars = star_by_system.get(system_name, "")
+                finite_values = system_values[np.isfinite(system_values)]
+                if not stars or finite_values.size == 0:
+                    continue
+                axis.text(
+                    float(np.max(finite_values)) + annotation_padding,
+                    position,
+                    stars,
+                    va="center",
+                    ha="left",
+                    fontsize=12,
+                    fontweight="bold",
+                    color="#111111",
+                )
+
+    figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.88))
+    figure.suptitle(
+        f"{family_id}: interaction-count and SASA distributions normalized to the WT median\n"
+        "Counts show framewise replicate-mean distributions divided by the WT median; "
+        "SASA shows residue-summed replicate means divided by the WT median. "
+        "Count stars mark distribution-shift tests on 100-frame block means; "
+        "SASA stars mark Welch tests on replicate means, all after BH correction "
+        "(* < 0.05, ** < 0.01, *** < 0.001).",
+        fontsize=12.5,
+        y=0.98,
+    )
+    return figure
+
+
+def plot_md_variant_pair_delta_bars(
+    family_id: str,
+    variant_system: str,
+    metadata_df: pd.DataFrame,
+    pair_delta_by_metric: dict[str, pd.DataFrame],
+):
+    variant_label = get_md_variant_display_label(metadata_df, variant_system)
+    figure, axes = plt.subplots(1, 3, figsize=(22, 7), constrained_layout=True)
+
+    for axis, metric_name in zip(axes, MD_VARIANT_PAIR_METRICS):
+        variant_df = pair_delta_by_metric[metric_name].loc[
+            pair_delta_by_metric[metric_name]["variant_system"].eq(variant_system)
+        ].copy()
+        variant_df = variant_df.sort_values("delta_occupancy")
+        selected_df = pd.concat(
+            [variant_df.head(5), variant_df.tail(5)],
+            ignore_index=True,
+        ).sort_values("delta_occupancy")
+        if selected_df.empty:
+            axis.set_visible(False)
+            continue
+
+        bar_colors = np.where(
+            selected_df["delta_occupancy"] >= 0.0,
+            "#1b9e77",
+            "#d95f02",
+        )
+        edge_colors = np.where(
+            selected_df["is_local_pair"],
+            "#111111",
+            "#ffffff",
+        )
+        axis.barh(
+            np.arange(len(selected_df)),
+            selected_df["delta_occupancy"],
+            color=bar_colors,
+            edgecolor=edge_colors,
+            linewidth=1.0,
+        )
+        axis.axvline(0.0, color="#333333", linewidth=1.0)
+        axis.set_yticks(np.arange(len(selected_df)))
+        axis.set_yticklabels(
+            [wrap_md_variant_label(label, width=24) for label in selected_df["pair_label"]],
+            fontsize=9,
+        )
+        axis.set_xlabel("Variant mean occupancy - WT mean occupancy")
+        axis.set_title(
+            {
+                "residue_contact_pairs": "Residue contacts",
+                "saltbridge_pairs": "Salt bridges",
+                "hbond_pairs": "Hydrogen bonds",
+            }[metric_name]
+        )
+        axis.grid(axis="x", alpha=0.18, linewidth=0.5)
+
+    legend_handles = [
+        plt.Rectangle((0, 0), 1, 1, facecolor="#1b9e77", label="Gained occupancy"),
+        plt.Rectangle((0, 0), 1, 1, facecolor="#d95f02", label="Lost occupancy"),
+        plt.Rectangle((0, 0), 1, 1, facecolor="#bbbbbb", edgecolor="#111111", label="Touches local mutation neighborhood"),
+    ]
+    figure.legend(
+        handles=legend_handles,
+        loc="upper center",
+        ncol=3,
+        frameon=False,
+        bbox_to_anchor=(0.5, 1.02),
+    )
+    figure.suptitle(
+        f"{family_id} / {variant_label}: top gained and lost interactions vs WT\n"
+        "Outlined bars mark pairs that include mutation-neighborhood residues.",
+        fontsize=13,
+        y=1.05,
+    )
+    return figure
+
+
+def plot_md_family_local_signal_heatmap(
+    family_id: str,
+    metadata_df: pd.DataFrame,
+    variant_signal_df: pd.DataFrame,
+):
+    plot_df = build_md_variant_local_signal_plot_table(
+        variant_signal_df=variant_signal_df,
+        metadata_df=metadata_df,
+        family_id=family_id,
+    )
+    heatmap_columns = [
+        "delta_rmsf_neighborhood_mean",
+        "delta_sasa_neighborhood_mean",
+        "delta_ordered_ss_neighborhood_mean",
+        "contact_gain_local",
+        "saltbridge_gain_local",
+        "hbond_gain_local",
+        "contact_gain_local_fraction",
+        "hbond_gain_local_fraction",
+    ]
+    label_map = {
+        "delta_rmsf_neighborhood_mean": "Neighborhood RMSF delta",
+        "delta_sasa_neighborhood_mean": "Neighborhood SASA delta",
+        "delta_ordered_ss_neighborhood_mean": "Neighborhood SS delta",
+        "contact_gain_local": "Local contact gain",
+        "saltbridge_gain_local": "Local salt-bridge gain",
+        "hbond_gain_local": "Local H-bond gain",
+        "contact_gain_local_fraction": "Local contact fraction",
+        "hbond_gain_local_fraction": "Local H-bond fraction",
+    }
+
+    figure, axis = plt.subplots(
+        figsize=(12, max(3.2, 0.42 * len(plot_df) + 1.8)),
+        constrained_layout=True,
+    )
+    image = axis.imshow(
+        plot_df[heatmap_columns].to_numpy(dtype=float),
+        aspect="auto",
+        cmap=MD_VARIANT_DELTA_CMAP,
+        norm=TwoSlopeNorm(vmin=-2.5, vcenter=0.0, vmax=2.5),
+    )
+    axis.set_xticks(np.arange(len(heatmap_columns)))
+    axis.set_xticklabels(
+        [label_map[column_name] for column_name in heatmap_columns],
+        rotation=45,
+        ha="right",
+    )
+    axis.set_yticks(np.arange(len(plot_df)))
+    axis.set_yticklabels(plot_df["variant_label"])
+    axis.set_title(
+        f"{family_id}: local mutation-neighborhood summary\n"
+        "Each column is standardized within the family to highlight relative local shifts between variants.",
+        fontsize=13,
+    )
+    colorbar = figure.colorbar(image, ax=axis, fraction=0.026, pad=0.02)
+    colorbar.set_label("Within-family z-score")
+    return figure
+
+
+def plot_md_family_secondary_structure_summary(
+    family_id: str,
+    metadata_df: pd.DataFrame,
+    ss_counts_summary_df: pd.DataFrame,
+    ss_residue_delta_df: pd.DataFrame,
+):
+    system_order = compute_md_variant_system_order(metadata_df, family_id)
+    system_summary_df = ss_counts_summary_df.loc[
+        ss_counts_summary_df["system"].isin(system_order)
+    ].copy()
+    system_summary_df["system"] = pd.Categorical(
+        system_summary_df["system"],
+        categories=system_order,
+        ordered=True,
+    )
+    system_summary_df = system_summary_df.sort_values("system")
+    system_labels = [
+        get_md_variant_display_label(metadata_df, system_name)
+        for system_name in system_summary_df["system"]
+    ]
+
+    variant_order = compute_md_variant_order(metadata_df, family_id)
+    family_ss_delta_df = ss_residue_delta_df.loc[
+        ss_residue_delta_df["family"].eq(family_id)
+    ].copy()
+    family_ss_delta_df["variant_system"] = pd.Categorical(
+        family_ss_delta_df["variant_system"],
+        categories=variant_order,
+        ordered=True,
+    )
+    family_ss_delta_df = family_ss_delta_df.sort_values(["variant_system", "resid"])
+    helix_pivot = family_ss_delta_df.pivot(
+        index="variant_system",
+        columns="resid",
+        values="delta_helix_occupancy",
+    ).loc[variant_order]
+    strand_pivot = family_ss_delta_df.pivot(
+        index="variant_system",
+        columns="resid",
+        values="delta_strand_occupancy",
+    ).loc[variant_order]
+
+    residue_numbers = helix_pivot.columns.to_numpy(dtype=int)
+    tick_values = choose_residue_ticks(residue_numbers)
+    tick_positions = [
+        int(np.where(residue_numbers == tick_value)[0][0])
+        for tick_value in tick_values
+        if tick_value in residue_numbers
+    ]
+    row_labels = [
+        get_md_variant_display_label(metadata_df, system_name)
+        for system_name in variant_order
+    ]
+
+    combined_delta_values = np.concatenate(
+        [
+            helix_pivot.to_numpy(dtype=float).ravel(),
+            strand_pivot.to_numpy(dtype=float).ravel(),
+        ]
+    )
+    finite_delta_values = combined_delta_values[np.isfinite(combined_delta_values)]
+    max_abs_delta = float(np.max(np.abs(finite_delta_values))) if len(finite_delta_values) else 1e-3
+    max_abs_delta = max(max_abs_delta, 1e-3)
+
+    figure = plt.figure(figsize=(17, 12), constrained_layout=True)
+    grid_spec = figure.add_gridspec(3, 1, height_ratios=[1.1, 1.0, 1.0])
+    axis_bar = figure.add_subplot(grid_spec[0, 0])
+    axis_helix = figure.add_subplot(grid_spec[1, 0])
+    axis_strand = figure.add_subplot(grid_spec[2, 0])
+
+    x_positions = np.arange(len(system_summary_df))
+    axis_bar.bar(x_positions, system_summary_df["helix_fraction_mean"], color="#ef8a62", label="Helix")
+    axis_bar.bar(
+        x_positions,
+        system_summary_df["strand_fraction_mean"],
+        bottom=system_summary_df["helix_fraction_mean"],
+        color="#67a9cf",
+        label="Strand",
+    )
+    axis_bar.bar(
+        x_positions,
+        system_summary_df["loop_fraction_mean"],
+        bottom=system_summary_df["helix_fraction_mean"] + system_summary_df["strand_fraction_mean"],
+        color="#d9d9d9",
+        label="Loop",
+    )
+    axis_bar.set_xticks(x_positions)
+    axis_bar.set_xticklabels(system_labels, rotation=45, ha="right")
+    axis_bar.set_ylabel("Mean fraction")
+    axis_bar.set_title("Global secondary-structure composition per system")
+    axis_bar.legend(frameon=False, ncol=3, loc="upper right")
+    axis_bar.grid(axis="y", alpha=0.18, linewidth=0.5)
+
+    helix_image = axis_helix.imshow(
+        helix_pivot.to_numpy(dtype=float),
+        aspect="auto",
+        cmap=MD_VARIANT_DELTA_CMAP,
+        norm=TwoSlopeNorm(vmin=-max_abs_delta, vcenter=0.0, vmax=max_abs_delta),
+    )
+    axis_helix.set_yticks(np.arange(len(row_labels)))
+    axis_helix.set_yticklabels(row_labels)
+    axis_helix.set_xticks(tick_positions)
+    axis_helix.set_xticklabels(tick_values)
+    axis_helix.set_ylabel("Variant")
+    axis_helix.set_title("Per-residue helix occupancy delta (variant - WT)")
+
+    strand_image = axis_strand.imshow(
+        strand_pivot.to_numpy(dtype=float),
+        aspect="auto",
+        cmap=MD_VARIANT_DELTA_CMAP,
+        norm=TwoSlopeNorm(vmin=-max_abs_delta, vcenter=0.0, vmax=max_abs_delta),
+    )
+    axis_strand.set_yticks(np.arange(len(row_labels)))
+    axis_strand.set_yticklabels(row_labels)
+    axis_strand.set_xticks(tick_positions)
+    axis_strand.set_xticklabels(tick_values)
+    axis_strand.set_xlabel("Residue number")
+    axis_strand.set_ylabel("Variant")
+    axis_strand.set_title("Per-residue strand occupancy delta (variant - WT)")
+
+    colorbar = figure.colorbar(strand_image, ax=[axis_helix, axis_strand], fraction=0.02, pad=0.01)
+    colorbar.set_label("Occupancy delta")
+    figure.suptitle(
+        f"{family_id}: secondary-structure retention summary\n"
+        "Positive helix or strand deltas indicate residues that retain ordered secondary structure more often than WT.",
+        fontsize=14,
+    )
+    return figure
+
+
+def plot_md_variant_signal_dashboard(
+    variant_signal_df: pd.DataFrame,
+):
+    dashboard_columns = MD_VARIANT_SIGNAL_COLUMNS + [
+        "delta_ordered_fraction_global",
+        "contact_gain_local_fraction",
+        "saltbridge_gain_local_fraction",
+        "hbond_gain_local_fraction",
+    ]
+    label_map = {
+        "rmsf_neighborhood_gain": "Lower local RMSF",
+        "contact_gain_total": "Contact gain",
+        "saltbridge_gain_total": "Salt-bridge gain",
+        "hbond_gain_total": "H-bond gain",
+        "sasa_neighborhood_gain": "Lower local SASA",
+        "ordered_ss_neighborhood_gain": "Higher local SS",
+        "delta_ordered_fraction_global": "Higher global SS",
+        "contact_gain_local_fraction": "Contact gain local",
+        "saltbridge_gain_local_fraction": "Salt-bridge gain local",
+        "hbond_gain_local_fraction": "H-bond gain local",
+    }
+    dashboard_df = variant_signal_df[
+        ["family", "variant_label", "composite_stabilizing_score", *dashboard_columns]
+    ].copy()
+    dashboard_df = dashboard_df.sort_values(
+        ["composite_stabilizing_score", "family"],
+        ascending=[False, True],
+    ).reset_index(drop=True)
+
+    standardized_df = dashboard_df[dashboard_columns].copy()
+    for column_name in dashboard_columns:
+        values = standardized_df[column_name].astype(float)
+        if float(values.std(ddof=0)) > 0:
+            standardized_df[column_name] = (values - values.mean()) / values.std(ddof=0)
+        else:
+            standardized_df[column_name] = 0.0
+
+    figure, axis = plt.subplots(
+        figsize=(13, max(4.2, 0.42 * len(dashboard_df) + 2.1)),
+        constrained_layout=True,
+    )
+    image = axis.imshow(
+        standardized_df.to_numpy(dtype=float),
+        aspect="auto",
+        cmap=MD_VARIANT_DELTA_CMAP,
+        norm=TwoSlopeNorm(vmin=-2.5, vcenter=0.0, vmax=2.5),
+    )
+    axis.set_xticks(np.arange(len(dashboard_columns)))
+    axis.set_xticklabels(
+        [label_map[column_name] for column_name in dashboard_columns],
+        rotation=45,
+        ha="right",
+    )
+    axis.set_yticks(np.arange(len(dashboard_df)))
+    axis.set_yticklabels(
+        [f"{row.family} / {row.variant_label}" for row in dashboard_df.itertuples()],
+        fontsize=9,
+    )
+    axis.set_title(
+        "Variant stabilizing-signal dashboard\n"
+        "Colors are z-scores across variants, so red means a stronger WT-relative stabilizing signature in that column.",
+        fontsize=13,
+    )
+
+    previous_family = None
+    for row_index, family_id in enumerate(dashboard_df["family"]):
+        if previous_family is not None and family_id != previous_family:
+            axis.axhline(row_index - 0.5, color="#222222", linewidth=1.0)
+        previous_family = family_id
+
+    colorbar = figure.colorbar(image, ax=axis, fraction=0.026, pad=0.02)
+    colorbar.set_label("Across-variant z-score")
+    return figure
+
+
+def plot_md_variant_family_pattern_heatmap(
+    family_pattern_summary_df: pd.DataFrame,
+):
+    plot_df = family_pattern_summary_df.loc[
+        family_pattern_summary_df["family"].ne("ALL")
+    ].copy()
+    heatmap_columns = [
+        "fraction_lower_local_rmsf",
+        "fraction_lower_local_sasa",
+        "fraction_higher_local_ss",
+        "fraction_contact_gain",
+        "fraction_saltbridge_gain",
+        "fraction_hbond_gain",
+        "median_contact_local_fraction",
+        "median_hbond_local_fraction",
+    ]
+    label_map = {
+        "fraction_lower_local_rmsf": "Lower local RMSF",
+        "fraction_lower_local_sasa": "Lower local SASA",
+        "fraction_higher_local_ss": "Higher local SS",
+        "fraction_contact_gain": "Any contact gain",
+        "fraction_saltbridge_gain": "Any salt-bridge gain",
+        "fraction_hbond_gain": "Any H-bond gain",
+        "median_contact_local_fraction": "Contact gain local",
+        "median_hbond_local_fraction": "H-bond gain local",
+    }
+
+    figure, axis = plt.subplots(figsize=(10, 4.5), constrained_layout=True)
+    image = axis.imshow(
+        plot_df[heatmap_columns].to_numpy(dtype=float),
+        aspect="auto",
+        cmap=MD_VARIANT_OCCUPANCY_CMAP,
+        vmin=0.0,
+        vmax=1.0,
+    )
+    axis.set_xticks(np.arange(len(heatmap_columns)))
+    axis.set_xticklabels(
+        [label_map[column_name] for column_name in heatmap_columns],
+        rotation=45,
+        ha="right",
+    )
+    axis.set_yticks(np.arange(len(plot_df)))
+    axis.set_yticklabels(plot_df["family"])
+    axis.set_title(
+        "Shared family-level patterns\n"
+        "Each value is the fraction of variants in a family showing the named stabilizing trend.",
+        fontsize=13,
+    )
+
+    for row_index in range(len(plot_df)):
+        for column_index, column_name in enumerate(heatmap_columns):
+            value = float(plot_df.iloc[row_index][column_name])
+            axis.text(
+                column_index,
+                row_index,
+                f"{value:.2f}",
+                ha="center",
+                va="center",
+                color="white" if value > 0.55 else "black",
+                fontsize=9,
+            )
+
+    colorbar = figure.colorbar(image, ax=axis, fraction=0.026, pad=0.02)
+    colorbar.set_label("Fraction / median local fraction")
+    return figure
