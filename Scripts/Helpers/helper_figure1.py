@@ -61,11 +61,13 @@ def merge_ogt_annotations(input_dir: str | Path = "Data/Figure1") -> Path:
     )
 
 
-def merge_uniprot_annotations(input_dir: str | Path = "Data/Figure1") -> Path:
+def merge_uniprot_annotations(
+    input_dir: str | Path = "Data/Figure1/EggNOG_annotations",
+) -> Path:
     return merge_emapper_annotations(
         input_dir=input_dir,
         pattern="file_*.emapper.annotations",
-        output_name="Uniprot.emapper.annotations",
+        output_name="../Uniprot.emapper.annotations",
     )
 
 

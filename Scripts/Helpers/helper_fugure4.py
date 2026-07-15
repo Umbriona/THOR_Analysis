@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import html
+import json
 from pathlib import Path
 import re
 import shutil
@@ -10,7 +12,7 @@ from typing import Iterable
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm, to_hex
 from scipy.stats import ttest_ind
 from statsmodels.stats.multitest import multipletests
 
@@ -23,6 +25,27 @@ DEFAULT_RMSF_DELTA_CMAP = LinearSegmentedColormap.from_list(
 
 def mm_to_inches(*mm_values: float) -> tuple[float, ...]:
     return tuple(float(value) / 25.4 for value in mm_values)
+
+
+def format_fixed_width_monospace_labels(
+    labels: Iterable[object],
+    extra_columns: int = 0,
+) -> tuple[list[str], int]:
+    label_strings = [str(label) for label in labels]
+    if not label_strings:
+        return [], 0
+
+    target_width = max(len(label) for label in label_strings) + max(int(extra_columns), 0)
+    return [label.rjust(target_width) for label in label_strings], target_width
+
+
+def estimate_monospace_label_width_inches(
+    num_columns: int,
+    font_size_pt: float,
+) -> float:
+    if num_columns <= 0:
+        return 0.0
+    return float(num_columns) * float(font_size_pt) * 0.62 / 72.0
 
 
 def short_variant_label(sample_name: str, family_id: str) -> str:
@@ -203,6 +226,24 @@ def tm_score_d0(length: int) -> float:
 
 
 def kabsch_superpose(reference_xyz: np.ndarray, mobile_xyz: np.ndarray) -> np.ndarray:
+    rotation_matrix, mobile_center, reference_center = compute_kabsch_transform(
+        reference_xyz=reference_xyz,
+        mobile_xyz=mobile_xyz,
+    )
+    return apply_kabsch_transform(
+        xyz=mobile_xyz,
+        rotation_matrix=rotation_matrix,
+        mobile_center=mobile_center,
+        reference_center=reference_center,
+    )
+
+
+def compute_kabsch_transform(
+    reference_xyz: np.ndarray,
+    mobile_xyz: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    reference_xyz = np.asarray(reference_xyz, dtype=float)
+    mobile_xyz = np.asarray(mobile_xyz, dtype=float)
     reference_center = reference_xyz.mean(axis=0)
     mobile_center = mobile_xyz.mean(axis=0)
 
@@ -217,13 +258,23 @@ def kabsch_superpose(reference_xyz: np.ndarray, mobile_xyz: np.ndarray) -> np.nd
         right_singular_vectors_t[-1, :] *= -1
         rotation_matrix = right_singular_vectors_t.T @ left_singular_vectors.T
 
-    return mobile_centered @ rotation_matrix + reference_center
+    return rotation_matrix, mobile_center, reference_center
 
 
-def compute_ca_superposition_metrics(
+def apply_kabsch_transform(
+    xyz: np.ndarray,
+    rotation_matrix: np.ndarray,
+    mobile_center: np.ndarray,
+    reference_center: np.ndarray,
+) -> np.ndarray:
+    xyz = np.asarray(xyz, dtype=float)
+    return (xyz - mobile_center) @ rotation_matrix + reference_center
+
+
+def compute_ca_superposition_alignment(
     structure_a_trace: pd.DataFrame,
     structure_b_trace: pd.DataFrame,
-) -> dict[str, float | int | None]:
+) -> dict[str, object]:
     paired_trace_df = structure_a_trace.merge(
         structure_b_trace,
         on=["chain_id", "residue_number", "insertion_code"],
@@ -234,7 +285,16 @@ def compute_ca_superposition_metrics(
 
     structure_a_xyz = paired_trace_df[["x_a", "y_a", "z_a"]].to_numpy(dtype=float)
     structure_b_xyz = paired_trace_df[["x_b", "y_b", "z_b"]].to_numpy(dtype=float)
-    aligned_structure_b_xyz = kabsch_superpose(reference_xyz=structure_a_xyz, mobile_xyz=structure_b_xyz)
+    rotation_matrix, mobile_center, reference_center = compute_kabsch_transform(
+        reference_xyz=structure_a_xyz,
+        mobile_xyz=structure_b_xyz,
+    )
+    aligned_structure_b_xyz = apply_kabsch_transform(
+        xyz=structure_b_xyz,
+        rotation_matrix=rotation_matrix,
+        mobile_center=mobile_center,
+        reference_center=reference_center,
+    )
 
     residue_distances = np.linalg.norm(structure_a_xyz - aligned_structure_b_xyz, axis=1)
     rmsd_angstrom = float(np.sqrt(np.mean(np.square(residue_distances))))
@@ -255,6 +315,11 @@ def compute_ca_superposition_metrics(
     )
 
     return {
+        "paired_trace_df": paired_trace_df,
+        "rotation_matrix": rotation_matrix,
+        "mobile_center": mobile_center,
+        "reference_center": reference_center,
+        "aligned_mobile_xyz": aligned_structure_b_xyz,
         "aligned_length": int(len(paired_trace_df)),
         "rmsd_angstrom": rmsd_angstrom,
         "seq_identity_aligned": float(residue_identity),
@@ -262,6 +327,25 @@ def compute_ca_superposition_metrics(
         "tm_score_to_structure_b": tm_score_to_structure_b,
         "aligned_fraction_to_structure_a": float(len(paired_trace_df) / max(1, structure_a_length)),
         "aligned_fraction_to_structure_b": float(len(paired_trace_df) / max(1, structure_b_length)),
+    }
+
+
+def compute_ca_superposition_metrics(
+    structure_a_trace: pd.DataFrame,
+    structure_b_trace: pd.DataFrame,
+) -> dict[str, float | int | None]:
+    alignment_result = compute_ca_superposition_alignment(
+        structure_a_trace=structure_a_trace,
+        structure_b_trace=structure_b_trace,
+    )
+    return {
+        "aligned_length": alignment_result["aligned_length"],
+        "rmsd_angstrom": alignment_result["rmsd_angstrom"],
+        "seq_identity_aligned": alignment_result["seq_identity_aligned"],
+        "tm_score_to_structure_a": alignment_result["tm_score_to_structure_a"],
+        "tm_score_to_structure_b": alignment_result["tm_score_to_structure_b"],
+        "aligned_fraction_to_structure_a": alignment_result["aligned_fraction_to_structure_a"],
+        "aligned_fraction_to_structure_b": alignment_result["aligned_fraction_to_structure_b"],
     }
 
 
@@ -1760,6 +1844,8 @@ class MDVariantAnalysisBundle:
     interaction_count_replicate_by_metric: dict[str, pd.DataFrame]
     interaction_count_block_by_metric: dict[str, pd.DataFrame]
     global_sasa_replicate_df: pd.DataFrame
+    pair_replicate_by_metric: dict[str, pd.DataFrame]
+    pair_residue_replicate_by_metric: dict[str, pd.DataFrame]
     pair_summary_by_metric: dict[str, pd.DataFrame]
     rmsf_delta_df: pd.DataFrame
     sasa_delta_df: pd.DataFrame
@@ -1768,6 +1854,33 @@ class MDVariantAnalysisBundle:
     pair_delta_by_metric: dict[str, pd.DataFrame]
     variant_signal_df: pd.DataFrame
     family_pattern_summary_df: pd.DataFrame
+
+
+@dataclass
+class MDVariantMolstarExportBundle:
+    viewer_index_df: pd.DataFrame
+    score_table_df: pd.DataFrame
+    global_rmsd_summary_df: pd.DataFrame
+
+
+@dataclass
+class WildtypeMolstarOverlayExportBundle:
+    viewer_index_df: pd.DataFrame
+    alignment_summary_df: pd.DataFrame
+
+
+@dataclass
+class WildtypeMolstarSuperpositionExport:
+    html_path: Path
+    pdb_path: Path
+    alignment_summary_df: pd.DataFrame
+
+
+@dataclass
+class WildtypeChimeraXCommandBundle:
+    residue_color_df: pd.DataFrame
+    apply_command: str
+    open_command: str
 
 
 def normalize_md_variant_metric_column_name(column_name: str) -> str:
@@ -1902,21 +2015,200 @@ def annotate_md_variant_metadata_with_tm(
     return annotated_df
 
 
+def build_md_variant_label_lookup(metadata_df: pd.DataFrame) -> pd.DataFrame:
+    output_columns = [
+        "family_order",
+        "family_id",
+        "wildtype_system",
+        "system",
+        "is_wildtype",
+        "plot_order_within_family",
+        "variant_rank_in_family",
+        "simple_label",
+        "simple_tm_display_label",
+        "short_label",
+        "tm_display_label",
+        "mutation_count",
+        "mutation_resids",
+        "mutation_labels",
+        "median_tm_celsius",
+        "wildtype_median_tm_celsius",
+        "delta_tm_to_wildtype_celsius",
+        "sequence_length",
+        "wt_sequence_length",
+        "structure_file",
+        "wt_structure_file",
+        "comparison_status",
+    ]
+    if metadata_df.empty:
+        return pd.DataFrame(columns=output_columns)
+
+    lookup_df = metadata_df.copy()
+    if "family" not in lookup_df.columns:
+        lookup_df["family"] = lookup_df["wt_system"]
+    if "is_wildtype" not in lookup_df.columns:
+        lookup_df["is_wildtype"] = lookup_df["comparison_status"].eq("wildtype")
+
+    tm_value_columns = [
+        "median_tm_celsius",
+        "wildtype_median_tm_celsius",
+        "delta_tm_to_wildtype_celsius",
+    ]
+    for column_name in tm_value_columns:
+        if column_name not in lookup_df.columns:
+            lookup_df[column_name] = np.nan
+
+    if "tm_display_label" not in lookup_df.columns:
+        lookup_df["tm_display_label"] = lookup_df.apply(
+            lambda row: row["short_label"]
+            if bool(row["is_wildtype"])
+            else format_tm_delta_label(row["short_label"], row["delta_tm_to_wildtype_celsius"]),
+            axis=1,
+        )
+
+    family_order_map = {
+        family_id: index + 1
+        for index, family_id in enumerate(order_md_variant_families(lookup_df))
+    }
+    lookup_df["family_order"] = lookup_df["family"].map(family_order_map).astype(int)
+    lookup_df["family_id"] = lookup_df["family"]
+    lookup_df["wildtype_system"] = lookup_df["wt_system"]
+    lookup_df = lookup_df.sort_values(
+        ["family_order", "is_wildtype", "mutation_count", "system"],
+        ascending=[True, False, True, True],
+    ).reset_index(drop=True)
+    lookup_df["plot_order_within_family"] = lookup_df.groupby("family_id").cumcount() + 1
+    lookup_df["variant_rank_in_family"] = 0
+    variant_mask = ~lookup_df["is_wildtype"].astype(bool)
+    lookup_df.loc[variant_mask, "variant_rank_in_family"] = (
+        lookup_df.loc[variant_mask]
+        .groupby("family_id")
+        .cumcount()
+        .add(1)
+    )
+    lookup_df["simple_label"] = lookup_df["variant_rank_in_family"].map(
+        lambda rank: "WT" if int(rank) == 0 else f"Variant{int(rank)}"
+    )
+    lookup_df["simple_tm_display_label"] = lookup_df.apply(
+        lambda row: row["simple_label"]
+        if bool(row["is_wildtype"])
+        else format_tm_delta_label(row["simple_label"], row["delta_tm_to_wildtype_celsius"]),
+        axis=1,
+    )
+    return lookup_df[output_columns].copy()
+
+
+def export_md_variant_label_lookup(
+    metadata_df: pd.DataFrame,
+    output_path: Path,
+) -> pd.DataFrame:
+    lookup_df = build_md_variant_label_lookup(metadata_df)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    lookup_df.to_csv(output_path, index=False, float_format="%.4f")
+    return lookup_df
+
+
+def load_md_variant_label_lookup(
+    label_lookup_path: Path,
+) -> pd.DataFrame:
+    lookup_df = pd.read_csv(label_lookup_path)
+    required_columns = {"family_id", "system", "simple_label", "simple_tm_display_label"}
+    missing_columns = required_columns.difference(lookup_df.columns)
+    if missing_columns:
+        missing_column_text = ", ".join(sorted(missing_columns))
+        raise ValueError(
+            f"MD variant label lookup is missing required columns: {missing_column_text}"
+        )
+    return lookup_df
+
+
+def annotate_md_variant_metadata_with_label_lookup(
+    metadata_df: pd.DataFrame,
+    label_lookup_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    if label_lookup_df is None or label_lookup_df.empty:
+        return metadata_df
+
+    merge_columns = [
+        column_name
+        for column_name in [
+            "family_id",
+            "system",
+            "variant_rank_in_family",
+            "simple_label",
+            "simple_tm_display_label",
+        ]
+        if column_name in label_lookup_df.columns
+    ]
+    if not {"family_id", "system"}.issubset(merge_columns):
+        return metadata_df
+
+    annotated_df = metadata_df.drop(
+        columns=[
+            column_name
+            for column_name in ["variant_rank_in_family", "simple_label", "simple_tm_display_label"]
+            if column_name in metadata_df.columns
+        ],
+        errors="ignore",
+    ).merge(
+        label_lookup_df[merge_columns].drop_duplicates(subset=["family_id", "system"]).rename(
+            columns={"family_id": "family"}
+        ),
+        on=["family", "system"],
+        how="left",
+        validate="one_to_one",
+    )
+    return annotated_df
+
+
+def _get_md_variant_row_value(row: object, column_name: str) -> object:
+    if isinstance(row, pd.Series):
+        return row.get(column_name, np.nan)
+    return getattr(row, column_name, np.nan)
+
+
+def get_md_variant_base_label_from_row(row: object) -> str:
+    simple_label = _get_md_variant_row_value(row, "simple_label")
+    if pd.notna(simple_label):
+        return str(simple_label)
+    return str(_get_md_variant_row_value(row, "short_label"))
+
+
+def get_md_variant_base_label(metadata_df: pd.DataFrame, system_name: str) -> str:
+    system_row_df = metadata_df.loc[metadata_df["system"].eq(system_name)]
+    if system_row_df.empty:
+        raise KeyError(f"Unknown MD variant system label: {system_name}")
+    return get_md_variant_base_label_from_row(system_row_df.iloc[0])
+
+
 def get_md_variant_display_label(metadata_df: pd.DataFrame, system_name: str) -> str:
     system_row_df = metadata_df.loc[metadata_df["system"].eq(system_name)]
     if system_row_df.empty:
         raise KeyError(f"Unknown MD variant system label: {system_name}")
 
+    if (
+        "simple_tm_display_label" in system_row_df.columns
+        and pd.notna(system_row_df["simple_tm_display_label"].iat[0])
+    ):
+        return str(system_row_df["simple_tm_display_label"].iat[0])
     if "tm_display_label" in system_row_df.columns and pd.notna(system_row_df["tm_display_label"].iat[0]):
         return str(system_row_df["tm_display_label"].iat[0])
+    if "simple_label" in system_row_df.columns and pd.notna(system_row_df["simple_label"].iat[0]):
+        return str(system_row_df["simple_label"].iat[0])
     return str(system_row_df["short_label"].iat[0])
 
 
 def get_md_variant_display_label_from_row(row: object) -> str:
-    display_label = getattr(row, "tm_display_label", np.nan)
+    display_label = _get_md_variant_row_value(row, "simple_tm_display_label")
     if pd.notna(display_label):
         return str(display_label)
-    return str(getattr(row, "short_label"))
+    display_label = _get_md_variant_row_value(row, "tm_display_label")
+    if pd.notna(display_label):
+        return str(display_label)
+    base_label = _get_md_variant_row_value(row, "simple_label")
+    if pd.notna(base_label):
+        return str(base_label)
+    return str(_get_md_variant_row_value(row, "short_label"))
 
 
 def build_md_family_rmsf_panel_title(
@@ -1924,7 +2216,7 @@ def build_md_family_rmsf_panel_title(
     label_wrap_width: int = 18,
 ) -> str:
     title_line = wrap_md_variant_label(
-        str(variant_metadata["short_label"]),
+        get_md_variant_base_label_from_row(variant_metadata),
         width=label_wrap_width,
     )
     subtitle_parts = []
@@ -1948,19 +2240,62 @@ def parse_md_variant_metric_window_suffix(metric_window_suffix: str) -> tuple[in
     return int(suffix_match.group(1)), int(suffix_match.group(2))
 
 
+def parse_md_variant_metric_window_suffix_if_numeric(
+    metric_window_suffix: str,
+) -> tuple[int, int] | None:
+    suffix_match = re.fullmatch(r"(\d+)_(\d+)", str(metric_window_suffix))
+    if not suffix_match:
+        return None
+    return int(suffix_match.group(1)), int(suffix_match.group(2))
+
+
 def discover_md_variant_metric_window_suffixes(
     metric_dir: Path,
     metric_name: str,
 ) -> list[str]:
-    pattern = re.compile(
-        rf"^all_systems_{re.escape(metric_name)}_(\d+)_(\d+)\.csv$"
-    )
+    pattern = re.compile(rf"^all_systems_{re.escape(metric_name)}_(.+)\.csv$")
     suffixes = []
     for metric_path in sorted(metric_dir.glob(f"all_systems_{metric_name}_*.csv")):
         match = pattern.match(metric_path.name)
         if match:
-            suffixes.append(f"{match.group(1)}_{match.group(2)}")
+            suffixes.append(match.group(1))
     return suffixes
+
+
+def resolve_md_variant_metric_window_bounds(
+    metric_dir: Path,
+    metric_names: Iterable[str],
+    metric_window_suffix: str,
+) -> tuple[int, int]:
+    metric_names = [str(metric_name) for metric_name in metric_names]
+    for metric_name in metric_names:
+        metric_path = (
+            metric_dir / f"all_systems_{metric_name}_{metric_window_suffix}.csv"
+        )
+        if not metric_path.exists():
+            continue
+        try:
+            metric_bounds_df = pd.read_csv(
+                metric_path,
+                usecols=["start", "stop"],
+                low_memory=False,
+            )
+        except ValueError:
+            continue
+        start_values = pd.to_numeric(metric_bounds_df["start"], errors="coerce").dropna()
+        stop_values = pd.to_numeric(metric_bounds_df["stop"], errors="coerce").dropna()
+        if not start_values.empty and not stop_values.empty:
+            return int(start_values.min()), int(stop_values.max())
+
+    numeric_bounds = parse_md_variant_metric_window_suffix_if_numeric(
+        metric_window_suffix
+    )
+    if numeric_bounds is not None:
+        return numeric_bounds
+    raise ValueError(
+        "Unable to determine MD metric window bounds for suffix "
+        f"'{metric_window_suffix}'"
+    )
 
 
 def resolve_md_variant_metric_window_suffix(
@@ -1988,7 +2323,11 @@ def resolve_md_variant_metric_window_suffix(
 
     common_suffixes = sorted(
         set.intersection(*available_suffixes_by_metric.values()),
-        key=lambda suffix: parse_md_variant_metric_window_suffix(suffix)[1],
+        key=lambda suffix: resolve_md_variant_metric_window_bounds(
+            metric_dir=metric_dir,
+            metric_names=required_metrics,
+            metric_window_suffix=suffix,
+        ),
     )
     if not common_suffixes:
         raise FileNotFoundError(
@@ -2004,6 +2343,8 @@ def resolve_md_variant_metric_window_suffix(
     else:
         requested_text = str(metric_window).strip()
         if re.fullmatch(r"\d+", requested_text):
+            requested_suffix = f"0_{requested_text}"
+        elif f"0_{requested_text}" in common_suffixes:
             requested_suffix = f"0_{requested_text}"
         else:
             requested_suffix = requested_text
@@ -2645,6 +2986,120 @@ def aggregate_md_variant_pair_metric(
     return summary_df
 
 
+def compute_md_variant_pair_replicate_table(
+    metric_df: pd.DataFrame,
+) -> pd.DataFrame:
+    if metric_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "system",
+                "replicate",
+                "replicate_index",
+                "pair_key",
+                "pair_label",
+                "resid_a",
+                "resname_a",
+                "resid_b",
+                "resname_b",
+                "occupancy_mean",
+            ]
+        )
+
+    return (
+        metric_df.groupby(
+            ["system", "replicate", "replicate_index", "pair_key"],
+            as_index=False,
+        )
+        .agg(
+            pair_label=("pair_label", "first"),
+            resid_a=("resid_a", "first"),
+            resname_a=("resname_a", "first"),
+            resid_b=("resid_b", "first"),
+            resname_b=("resname_b", "first"),
+            occupancy_mean=("occupancy", "mean"),
+        )
+        .sort_values(["system", "replicate_index", "pair_key"])
+        .reset_index(drop=True)
+    )
+
+
+def compute_md_variant_pair_residue_replicate_table(
+    metric_df: pd.DataFrame,
+) -> pd.DataFrame:
+    if metric_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "system",
+                "replicate",
+                "replicate_index",
+                "resid",
+                "resname",
+                "occupancy_sum",
+                "n_pairs",
+            ]
+        )
+
+    per_replicate_df = (
+        metric_df.groupby(
+            ["system", "replicate", "replicate_index", "pair_key"],
+            as_index=False,
+        )
+        .agg(
+            resid_a=("resid_a", "first"),
+            resname_a=("resname_a", "first"),
+            resid_b=("resid_b", "first"),
+            resname_b=("resname_b", "first"),
+            occupancy=("occupancy", "mean"),
+        )
+    )
+
+    endpoint_tables = []
+    for suffix in ("a", "b"):
+        endpoint_tables.append(
+            per_replicate_df[
+                [
+                    "system",
+                    "replicate",
+                    "replicate_index",
+                    "pair_key",
+                    f"resid_{suffix}",
+                    f"resname_{suffix}",
+                    "occupancy",
+                ]
+            ].rename(
+                columns={
+                    f"resid_{suffix}": "resid",
+                    f"resname_{suffix}": "resname",
+                }
+            )
+        )
+
+    residue_replicate_df = pd.concat(endpoint_tables, ignore_index=True)
+    residue_replicate_df["resid"] = pd.to_numeric(
+        residue_replicate_df["resid"],
+        errors="coerce",
+    ).astype("Int64")
+    residue_replicate_df = residue_replicate_df.dropna(subset=["resid"]).copy()
+    residue_replicate_df["resid"] = residue_replicate_df["resid"].astype(int)
+    residue_replicate_df["occupancy"] = pd.to_numeric(
+        residue_replicate_df["occupancy"],
+        errors="coerce",
+    ).fillna(0.0)
+
+    return (
+        residue_replicate_df.groupby(
+            ["system", "replicate", "replicate_index", "resid", "resname"],
+            as_index=False,
+        )
+        .agg(
+            occupancy_sum=("occupancy", "sum"),
+            n_pairs=("pair_key", "nunique"),
+        )
+        .sort_values(["system", "replicate_index", "resid"])
+        .reset_index(drop=True)
+    )
+
+
 def compute_md_variant_system_order(metadata_df: pd.DataFrame, family_id: str) -> list[str]:
     family_metadata_df = metadata_df.loc[metadata_df["family"].eq(family_id)].copy()
     family_metadata_df["sort_order"] = np.where(
@@ -3151,11 +3606,3688 @@ def build_md_variant_family_pattern_summary(
     return pd.DataFrame(family_rows)
 
 
+def _compute_md_variant_group_zscores(values: pd.Series) -> pd.Series:
+    numeric_values = pd.to_numeric(values, errors="coerce").astype(float)
+    std_value = float(numeric_values.std(ddof=0))
+    if not np.isfinite(std_value) or np.isclose(std_value, 0.0):
+        return pd.Series(np.zeros(len(numeric_values), dtype=float), index=values.index)
+    return (numeric_values - float(numeric_values.mean())) / std_value
+
+
+def summarize_md_variant_pair_deltas_by_residue(
+    pair_delta_df: pd.DataFrame,
+) -> pd.DataFrame:
+    if pair_delta_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "family",
+                "variant_system",
+                "variant_label",
+                "resid",
+                "resname",
+                "score_raw",
+                "gain_raw",
+                "loss_raw",
+                "n_pairs",
+                "any_local_pair",
+                "any_mutation_pair",
+            ]
+        )
+
+    endpoint_tables = []
+    for suffix in ("a", "b"):
+        endpoint_tables.append(
+            pair_delta_df[
+                [
+                    "family",
+                    "variant_system",
+                    "variant_label",
+                    f"resid_{suffix}",
+                    f"resname_{suffix}",
+                    "pair_key",
+                    "delta_occupancy",
+                    "is_local_pair",
+                    "contains_mutation_pair",
+                ]
+            ].rename(
+                columns={
+                    f"resid_{suffix}": "resid",
+                    f"resname_{suffix}": "resname",
+                }
+            )
+        )
+
+    residue_delta_df = pd.concat(endpoint_tables, ignore_index=True)
+    residue_delta_df["resid"] = pd.to_numeric(
+        residue_delta_df["resid"],
+        errors="coerce",
+    ).astype("Int64")
+    residue_delta_df = residue_delta_df.dropna(subset=["resid"]).copy()
+    residue_delta_df["resid"] = residue_delta_df["resid"].astype(int)
+    residue_delta_df["delta_occupancy"] = pd.to_numeric(
+        residue_delta_df["delta_occupancy"],
+        errors="coerce",
+    ).fillna(0.0)
+    residue_delta_df["gain_component"] = residue_delta_df["delta_occupancy"].clip(lower=0.0)
+    residue_delta_df["loss_component"] = residue_delta_df["delta_occupancy"].clip(upper=0.0)
+
+    return (
+        residue_delta_df.groupby(
+            ["family", "variant_system", "variant_label", "resid", "resname"],
+            as_index=False,
+        )
+        .agg(
+            score_raw=("delta_occupancy", "sum"),
+            gain_raw=("gain_component", "sum"),
+            loss_raw=("loss_component", "sum"),
+            n_pairs=("pair_key", "nunique"),
+            any_local_pair=("is_local_pair", "max"),
+            any_mutation_pair=("contains_mutation_pair", "max"),
+        )
+        .sort_values(["family", "variant_system", "resid"])
+        .reset_index(drop=True)
+    )
+
+
+def build_md_variant_molstar_residue_score_table(
+    md_variant_bundle: MDVariantAnalysisBundle,
+    family_id: str,
+    metric_name: str,
+    z_threshold: float = 1.5,
+) -> pd.DataFrame:
+    metric_key = str(metric_name).strip().lower()
+    metric_alias_map = {
+        "rmsf": "rmsf",
+        "hhbond": "hbond_pairs",
+        "hhbonds": "hbond_pairs",
+        "hbond": "hbond_pairs",
+        "hbonds": "hbond_pairs",
+        "hbond_pairs": "hbond_pairs",
+        "saltbridge": "saltbridge_pairs",
+        "saltbridges": "saltbridge_pairs",
+        "saltbridge_pairs": "saltbridge_pairs",
+    }
+    resolved_metric_name = metric_alias_map.get(metric_key, metric_key)
+
+    if resolved_metric_name == "rmsf":
+        score_df = md_variant_bundle.rmsf_delta_df.loc[
+            md_variant_bundle.rmsf_delta_df["family"].eq(family_id),
+            [
+                "family",
+                "variant_system",
+                "variant_label",
+                "resid",
+                "resname",
+                "delta_rmsf",
+                "is_mutation_site",
+            ],
+        ].rename(
+            columns={
+                "delta_rmsf": "score_raw",
+                "is_mutation_site": "any_mutation_pair",
+            }
+        )
+        score_df["any_local_pair"] = [
+            int(resid) in md_variant_bundle.local_residue_sets.get(str(variant_system), set())
+            for variant_system, resid in zip(
+                score_df["variant_system"],
+                score_df["resid"],
+            )
+        ]
+    elif resolved_metric_name in {"hbond_pairs", "saltbridge_pairs"}:
+        pair_delta_df = md_variant_bundle.pair_delta_by_metric[resolved_metric_name].loc[
+            md_variant_bundle.pair_delta_by_metric[resolved_metric_name]["family"].eq(family_id)
+        ].copy()
+        score_df = summarize_md_variant_pair_deltas_by_residue(pair_delta_df)
+    else:
+        raise KeyError(
+            "Unsupported Mol* residue metric. Expected one of "
+            "'rmsf', 'hbond_pairs', or 'saltbridge_pairs'."
+        )
+
+    if score_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "family",
+                "variant_system",
+                "variant_label",
+                "metric_name",
+                "metric_label",
+                "resid",
+                "resname",
+                "score_raw",
+                "score_z",
+                "abs_score_z",
+                "passes_threshold",
+                "direction",
+                "z_threshold",
+                "bfactor_magnitude",
+            ]
+        )
+
+    score_df["metric_name"] = resolved_metric_name
+    metric_label_map = {
+        "rmsf": "RMSF",
+        "hbond_pairs": "Hydrogen bonds",
+        "saltbridge_pairs": "Salt bridges",
+    }
+    score_df["metric_label"] = metric_label_map[resolved_metric_name]
+    score_df["score_raw"] = pd.to_numeric(score_df["score_raw"], errors="coerce").fillna(0.0)
+    score_df["score_z"] = (
+        score_df.groupby("variant_system", group_keys=False)["score_raw"]
+        .apply(_compute_md_variant_group_zscores)
+        .astype(float)
+    )
+    score_df["abs_score_z"] = score_df["score_z"].abs()
+    score_df["passes_threshold"] = score_df["abs_score_z"] >= float(z_threshold)
+    score_df["direction"] = np.where(
+        score_df["score_z"] >= float(z_threshold),
+        "positive",
+        np.where(score_df["score_z"] <= -float(z_threshold), "negative", "neutral"),
+    )
+    score_df["z_threshold"] = float(z_threshold)
+    score_df["bfactor_magnitude"] = np.where(
+        score_df["passes_threshold"],
+        np.clip(score_df["abs_score_z"] * 20.0, 0.0, 99.99),
+        0.0,
+    )
+    return score_df.sort_values(["variant_system", "resid"]).reset_index(drop=True)
+
+
+def build_md_variant_global_rmsd_score_table(
+    md_variant_bundle: MDVariantAnalysisBundle,
+    metric_dir: Path,
+) -> pd.DataFrame:
+    rmsd_raw_df = read_md_variant_metric_table(
+        metric_dir=metric_dir,
+        metric_name="rmsd",
+        metric_window_suffix=md_variant_bundle.metric_window_suffix,
+    )
+    if rmsd_raw_df.empty:
+        return pd.DataFrame()
+
+    value_column = "ca_rmsd" if "ca_rmsd" in rmsd_raw_df.columns else "rmsd"
+    if value_column not in rmsd_raw_df.columns:
+        raise KeyError(
+            "Could not find an RMSD value column in the MD RMSD table. "
+            f"Available columns: {sorted(rmsd_raw_df.columns)}"
+        )
+
+    rmsd_raw_df[value_column] = pd.to_numeric(rmsd_raw_df[value_column], errors="coerce")
+    rmsd_raw_df = rmsd_raw_df.dropna(subset=[value_column]).copy()
+
+    per_replicate_df = (
+        rmsd_raw_df.groupby(["system", "replicate", "replicate_index"], as_index=False)
+        .agg(global_rmsd_mean=(value_column, "mean"))
+    )
+    system_summary_df = (
+        per_replicate_df.groupby("system", as_index=False)
+        .agg(
+            n_replicates=("replicate", "nunique"),
+            global_rmsd_mean=("global_rmsd_mean", "mean"),
+            global_rmsd_std=("global_rmsd_mean", "std"),
+        )
+    )
+    system_summary_df["global_rmsd_std"] = system_summary_df["global_rmsd_std"].fillna(0.0)
+
+    metadata_columns = [
+        column_name
+        for column_name in [
+            "system",
+            "family",
+            "is_wildtype",
+            "short_label",
+            "tm_display_label",
+            "simple_label",
+            "simple_tm_display_label",
+        ]
+        if column_name in md_variant_bundle.metadata_df.columns
+    ]
+    metadata_df = md_variant_bundle.metadata_df[metadata_columns].drop_duplicates()
+    summary_df = system_summary_df.merge(
+        metadata_df,
+        on="system",
+        how="inner",
+        validate="one_to_one",
+    )
+
+    family_tables = []
+    for family_id in md_variant_bundle.family_ids:
+        family_df = summary_df.loc[summary_df["family"].eq(family_id)].copy()
+        if family_df.empty:
+            continue
+
+        wildtype_match_df = family_df.loc[family_df["is_wildtype"]]
+        if wildtype_match_df.empty:
+            continue
+        wildtype_row = wildtype_match_df.iloc[0]
+
+        variant_df = family_df.loc[~family_df["is_wildtype"]].copy()
+        if variant_df.empty:
+            continue
+
+        variant_df["wt_system"] = str(wildtype_row["system"])
+        variant_df["wt_global_rmsd_mean"] = float(wildtype_row["global_rmsd_mean"])
+        variant_df["delta_global_rmsd"] = (
+            variant_df["global_rmsd_mean"] - variant_df["wt_global_rmsd_mean"]
+        )
+        variant_df["variant_label"] = variant_df.apply(
+            get_md_variant_display_label_from_row,
+            axis=1,
+        )
+        variant_df["score_z"] = _compute_md_variant_group_zscores(
+            variant_df["delta_global_rmsd"]
+        ).astype(float)
+        family_tables.append(variant_df)
+
+    if not family_tables:
+        return pd.DataFrame()
+
+    global_rmsd_summary_df = pd.concat(family_tables, ignore_index=True)
+    global_rmsd_summary_df["metric_name"] = "rmsd"
+    global_rmsd_summary_df["metric_label"] = "RMSD"
+    global_rmsd_summary_df["abs_score_z"] = global_rmsd_summary_df["score_z"].abs()
+    return global_rmsd_summary_df.sort_values(
+        ["family", "system"]
+    ).reset_index(drop=True)
+
+
+def _write_md_variant_bfactor_pdb(
+    template_pdb_path: Path,
+    residue_bfactor_map: dict[int, float],
+    output_path: Path,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with template_pdb_path.open() as source_handle, output_path.open("w") as target_handle:
+        for line in source_handle:
+            if line.startswith(("ATOM", "HETATM")) and len(line) >= 66:
+                residue_number = int(line[22:26])
+                bfactor_value = float(residue_bfactor_map.get(residue_number, 0.0))
+                target_handle.write(f"{line[:60]}{bfactor_value:6.2f}{line[66:]}")
+            else:
+                target_handle.write(line)
+
+
+def _write_transformed_pdb(
+    template_pdb_path: Path,
+    output_path: Path,
+    rotation_matrix: np.ndarray | None = None,
+    mobile_center: np.ndarray | None = None,
+    reference_center: np.ndarray | None = None,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if rotation_matrix is None or mobile_center is None or reference_center is None:
+        output_path.write_text(template_pdb_path.read_text())
+        return
+
+    rotation_matrix = np.asarray(rotation_matrix, dtype=float)
+    mobile_center = np.asarray(mobile_center, dtype=float)
+    reference_center = np.asarray(reference_center, dtype=float)
+
+    with template_pdb_path.open() as source_handle, output_path.open("w") as target_handle:
+        for line in source_handle:
+            if line.startswith(("ATOM", "HETATM")) and len(line) >= 54:
+                try:
+                    atom_xyz = np.asarray(
+                        [
+                            float(line[30:38]),
+                            float(line[38:46]),
+                            float(line[46:54]),
+                        ],
+                        dtype=float,
+                    )
+                except ValueError:
+                    target_handle.write(line)
+                    continue
+
+                aligned_xyz = apply_kabsch_transform(
+                    xyz=atom_xyz[np.newaxis, :],
+                    rotation_matrix=rotation_matrix,
+                    mobile_center=mobile_center,
+                    reference_center=reference_center,
+                )[0]
+                target_handle.write(
+                    f"{line[:30]}"
+                    f"{aligned_xyz[0]:8.3f}{aligned_xyz[1]:8.3f}{aligned_xyz[2]:8.3f}"
+                    f"{line[54:]}"
+                )
+            else:
+                target_handle.write(line)
+
+
+def _write_combined_overlay_pdb(
+    structure_entries: list[dict[str, object]],
+    output_path: Path,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    atom_serial_number = 1
+    with output_path.open("w") as target_handle:
+        for structure_entry in structure_entries:
+            pdb_path = Path(structure_entry["pdb_path"])
+            chain_id = str(structure_entry["chain_id"])[:1] or "A"
+            last_residue_name = "UNK"
+            last_residue_number = "   1"
+            last_insertion_code = " "
+
+            with pdb_path.open() as source_handle:
+                for line in source_handle:
+                    if line.startswith(("ATOM", "HETATM")):
+                        last_residue_name = line[17:20].strip() or "UNK"
+                        last_residue_number = line[22:26]
+                        last_insertion_code = line[26:27] if len(line) >= 27 else " "
+                        target_handle.write(
+                            f"{line[:6]}{atom_serial_number:5d}{line[11:21]}{chain_id}{line[22:]}"
+                        )
+                        atom_serial_number += 1
+
+            target_handle.write(
+                f"TER   {atom_serial_number:5d}      {last_residue_name:>3} {chain_id}{last_residue_number}{last_insertion_code}\n"
+            )
+            atom_serial_number += 1
+
+        target_handle.write("END\n")
+
+
+def _write_simple_molstar_html(
+    pdb_path: Path,
+    html_path: Path,
+    title: str,
+    subtitle: str,
+    viewer_height_px: int = 560,
+    footer_note: str | None = None,
+) -> None:
+    html_path.parent.mkdir(parents=True, exist_ok=True)
+    pdb_text = Path(pdb_path).read_text()
+    resolved_footer_note = (
+        footer_note
+        or "This page loads one aligned combined PDB directly into the standard Mol* viewer."
+    )
+
+    html_text = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{html.escape(title)}</title>
+  <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/molstar@5.10.1/build/viewer/molstar.css" />
+  <style>
+    body {{
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f5f6f8;
+      color: #101418;
+    }}
+    .wrap {{
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      min-height: 100vh;
+    }}
+    .header, .footer {{
+      padding: 14px 18px;
+      background: #ffffff;
+      box-shadow: 0 1px 0 rgba(16, 20, 24, 0.08);
+    }}
+    .header h1 {{
+      margin: 0 0 6px 0;
+      font-size: 16px;
+    }}
+    .header p, .footer p {{
+      margin: 0;
+      font-size: 12px;
+      line-height: 1.45;
+      color: #46515c;
+    }}
+    #app {{
+      position: relative;
+      width: 100%;
+      height: {int(viewer_height_px)}px;
+    }}
+    #app :is(.msp-plugin, .msp-layout-standard, .msp-layout-expanded) {{
+      min-height: {int(viewer_height_px)}px;
+    }}
+    #status {{
+      margin: 12px 18px 0 18px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      background: #eef5ff;
+      border: 1px solid #c8dcff;
+      color: #1c3f76;
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+    }}
+    #status[data-state="hidden"] {{
+      display: none;
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="header">
+      <h1>{html.escape(title)}</h1>
+      <p>{html.escape(subtitle)}</p>
+    </div>
+    <div id="status">Loading Mol* viewer...</div>
+    <div id="app"></div>
+    <div class="footer">
+      <p>{html.escape(resolved_footer_note)}</p>
+    </div>
+  </div>
+  <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/molstar@5.10.1/build/viewer/molstar.js"></script>
+  <script type="text/javascript">
+    const pdbText = {json.dumps(pdb_text)};
+    const statusEl = document.getElementById('status');
+    const backgroundColor = 0xf5f6f8;
+    const loadLabel = {json.dumps(title)};
+    const MolstarViewer = window.molstar?.Viewer;
+
+    function setStatus(message) {{
+      if (!statusEl) return;
+      if (!message) {{
+        statusEl.textContent = '';
+        statusEl.dataset.state = 'hidden';
+        return;
+      }}
+      statusEl.textContent = message;
+      delete statusEl.dataset.state;
+    }}
+
+    async function initialiseViewer() {{
+      if (!MolstarViewer?.create) {{
+        setStatus('Mol* failed to load from the CDN, so the viewer could not be created.');
+        return;
+      }}
+
+      try {{
+        const viewer = await MolstarViewer.create('app', {{
+          layoutIsExpanded: true,
+          layoutShowControls: true,
+          layoutShowRemoteState: false,
+          layoutShowSequence: true,
+          layoutShowLog: false,
+          layoutShowLeftPanel: true,
+          viewportShowExpand: true,
+          viewportShowSelectionMode: false,
+          viewportShowAnimation: false,
+          viewportBackgroundColor: backgroundColor,
+        }});
+        await viewer.loadStructureFromData(pdbText, 'pdb', {{
+          dataLabel: loadLabel,
+        }});
+        setStatus('');
+      }} catch (error) {{
+        console.error('Mol* superposition viewer initialization failed.', error);
+        setStatus(`Mol* superposition viewer initialization failed: ${{error?.message ?? error}}`);
+      }}
+    }}
+
+    initialiseViewer();
+  </script>
+</body>
+</html>
+"""
+    html_path.write_text(html_text)
+
+
+def _build_md_variant_residue_color_map(
+    residue_score_map: dict[int, float],
+    z_threshold: float,
+    score_limit: float | None = None,
+    color_bins: int = 41,
+) -> tuple[dict[int, str], float]:
+    if not residue_score_map:
+        return {}, max(float(z_threshold), 1.0)
+
+    score_values = np.asarray(list(residue_score_map.values()), dtype=float)
+    score_values = score_values[np.isfinite(score_values)]
+    if not len(score_values):
+        return {}, max(float(z_threshold), 1.0)
+
+    resolved_limit = (
+        float(np.nanmax(np.abs(score_values)))
+        if score_limit is None
+        else float(score_limit)
+    )
+    resolved_limit = max(resolved_limit, float(z_threshold), 1e-6)
+    norm = TwoSlopeNorm(vmin=-resolved_limit, vcenter=0.0, vmax=resolved_limit)
+    bin_edges = np.linspace(-resolved_limit, resolved_limit, max(int(color_bins), 3), dtype=float)
+    color_cache: dict[float, str] = {}
+    residue_color_map: dict[int, str] = {}
+
+    for residue_number, score_value in residue_score_map.items():
+        score_value = float(score_value)
+        if not np.isfinite(score_value) or abs(score_value) < float(z_threshold):
+            continue
+
+        clipped_value = float(np.clip(score_value, -resolved_limit, resolved_limit))
+        bin_index = int(np.clip(np.digitize([clipped_value], bin_edges, right=True)[0], 1, len(bin_edges) - 1))
+        binned_value = float(bin_edges[bin_index])
+        if binned_value not in color_cache:
+            color_cache[binned_value] = to_hex(
+                DEFAULT_RMSF_DELTA_CMAP(norm(binned_value)),
+                keep_alpha=False,
+            )
+        residue_color_map[int(residue_number)] = color_cache[binned_value]
+
+    return residue_color_map, resolved_limit
+
+
+def _write_md_variant_molstar_html(
+    pdb_path: Path,
+    html_path: Path,
+    title: str,
+    subtitle: str,
+    residue_color_map: dict[int, str],
+    all_residue_numbers: list[int],
+    score_limit: float,
+    viewer_height_px: int = 560,
+) -> None:
+    html_path.parent.mkdir(parents=True, exist_ok=True)
+    pdb_text = pdb_path.read_text()
+    grouped_residue_colors: dict[str, list[int]] = {}
+    for residue_number, color_hex in residue_color_map.items():
+        grouped_residue_colors.setdefault(str(color_hex), []).append(int(residue_number))
+    grouped_residue_colors = {
+        color_hex: sorted(residue_numbers)
+        for color_hex, residue_numbers in grouped_residue_colors.items()
+    }
+    colored_residue_numbers = sorted({int(residue_number) for residue_number in residue_color_map})
+    neutral_residue_numbers = sorted(
+        int(residue_number)
+        for residue_number in all_residue_numbers
+        if int(residue_number) not in residue_color_map
+    )
+
+    html_text = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{html.escape(title)}</title>
+  <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/molstar@5.10.1/build/viewer/molstar.css" />
+  <style>
+    body {{
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f5f6f8;
+      color: #101418;
+    }}
+    .wrap {{
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      min-height: 100vh;
+    }}
+    .header, .footer {{
+      padding: 14px 18px;
+      background: #ffffff;
+      box-shadow: 0 1px 0 rgba(16, 20, 24, 0.08);
+    }}
+    .header h1 {{
+      margin: 0 0 6px 0;
+      font-size: 16px;
+    }}
+    .header p, .footer p {{
+      margin: 0;
+      font-size: 12px;
+      line-height: 1.45;
+      color: #46515c;
+    }}
+    #app {{
+      position: relative;
+      width: 100%;
+      height: {int(viewer_height_px)}px;
+    }}
+    #app :is(.msp-plugin, .msp-layout-standard, .msp-layout-expanded) {{
+      min-height: {int(viewer_height_px)}px;
+    }}
+    .legend {{
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 10px;
+      align-items: center;
+      margin: 0 18px 12px 18px;
+      font-size: 12px;
+      color: #46515c;
+    }}
+    .legend-bar {{
+      height: 12px;
+      border-radius: 999px;
+      background: linear-gradient(90deg, #2166ac 0%, #f7f7f7 50%, #b2182b 100%);
+      border: 1px solid rgba(16, 20, 24, 0.12);
+    }}
+    #status {{
+      margin: 12px 18px 0 18px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      background: #fff3cd;
+      border: 1px solid #f1d58a;
+      color: #5f4400;
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+    }}
+    #status[data-state="loading"] {{
+      background: #eef5ff;
+      border-color: #c8dcff;
+      color: #1c3f76;
+    }}
+    #status[data-state="hidden"] {{
+      display: none;
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="header">
+      <h1>{html.escape(title)}</h1>
+      <p>{html.escape(subtitle)}</p>
+    </div>
+    <div id="status" data-state="loading">Loading Mol* viewer...</div>
+    <div id="app"></div>
+    <div class="legend">
+      <span>Lower than WT</span>
+      <div class="legend-bar" aria-hidden="true"></div>
+      <span>Higher than WT</span>
+    </div>
+    <div class="footer">
+      <p>Color intensity saturates at |z| = {float(score_limit):0.2f}. Residues below the export threshold remain gray.</p>
+    </div>
+  </div>
+  <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/molstar@5.10.1/build/viewer/molstar.js"></script>
+  <script type="text/javascript">
+    const pdbText = {json.dumps(pdb_text)};
+    const groupedResidueColors = {json.dumps(grouped_residue_colors, sort_keys=True)};
+    const neutralResidueNumbers = {json.dumps(neutral_residue_numbers)};
+    const statusEl = document.getElementById('status');
+    const neutralColor = '#d9dde3';
+    const backgroundColor = 0xf5f6f8;
+    const loadLabel = {json.dumps(title)};
+    const MolstarLib = window.molstar?.lib;
+
+    function setStatus(message, state = 'error') {{
+      if (!statusEl) return;
+      if (!message) {{
+        statusEl.textContent = '';
+        statusEl.dataset.state = 'hidden';
+        return;
+      }}
+      statusEl.textContent = message;
+      statusEl.dataset.state = state;
+    }}
+
+    function colorHexToMolstarInt(colorHex) {{
+      return Number.parseInt(String(colorHex).replace('#', ''), 16);
+    }}
+
+    function residuesToLoci(structure, residueNumbers) {{
+      if (!Array.isArray(residueNumbers) || !residueNumbers.length) return null;
+      const root = structure.root ?? structure;
+      let loci = MolstarLib.structure.StructureElement.Loci.fromSchema(root, {{
+        items: {{
+          auth_seq_id: residueNumbers,
+        }},
+      }});
+      if (!loci?.elements?.length) {{
+        loci = MolstarLib.structure.StructureElement.Loci.fromSchema(root, {{
+          items: {{
+            label_seq_id: residueNumbers,
+          }},
+        }});
+      }}
+      return loci?.elements?.length ? loci : null;
+    }}
+
+    async function applySignedResidueOverpaint(viewer) {{
+      const structures = viewer.plugin.managers.structure.hierarchy.current.structures ?? [];
+      if (!structures.length) return;
+
+      const layerDefs = [];
+      if (neutralResidueNumbers.length) {{
+        layerDefs.push({{
+          residueNumbers: neutralResidueNumbers,
+          color: colorHexToMolstarInt(neutralColor),
+        }});
+      }}
+      for (const [colorHex, residueNumbers] of Object.entries(groupedResidueColors)) {{
+        if (!Array.isArray(residueNumbers) || !residueNumbers.length) continue;
+        layerDefs.push({{
+          residueNumbers: residueNumbers,
+          color: colorHexToMolstarInt(colorHex),
+        }});
+      }}
+      if (!layerDefs.length) return;
+
+      const update = viewer.plugin.state.data.build();
+      for (const structureRef of structures) {{
+        for (const representationRef of structureRef.representations) {{
+          const structure = representationRef.cell.obj?.data?.sourceData;
+          if (!structure) continue;
+
+          const bundleLayers = [];
+          for (const layerDef of layerDefs) {{
+            const loci = residuesToLoci(structure, layerDef.residueNumbers);
+            if (!loci) continue;
+            bundleLayers.push({{
+              bundle: MolstarLib.structure.StructureElement.Bundle.fromLoci(loci),
+              color: layerDef.color,
+              clear: false,
+            }});
+          }}
+          if (!bundleLayers.length) continue;
+
+          update.to(representationRef.cell.transform.ref).apply(
+            MolstarLib.plugin.StateTransforms.Representation.OverpaintStructureRepresentation3DFromBundle,
+            {{
+              layers: bundleLayers,
+            }},
+            {{ tags: 'md-variant-signed-overpaint' }},
+          );
+        }}
+      }}
+
+      await update.commit({{ doNotUpdateCurrent: true }});
+    }}
+
+    async function initialiseViewer() {{
+      if (!window.molstar?.Viewer?.create || !MolstarLib?.structure?.StructureElement || !MolstarLib?.plugin?.StateTransforms) {{
+        setStatus(
+          'Mol* loaded incompletely from the CDN. The standard viewer APIs for signed residue coloring are unavailable in this page.',
+        );
+        return;
+      }}
+
+      try {{
+        const viewer = await molstar.Viewer.create('app', {{
+          layoutIsExpanded: true,
+          layoutShowControls: true,
+          layoutShowRemoteState: false,
+          layoutShowSequence: true,
+          layoutShowLog: false,
+          layoutShowLeftPanel: true,
+          viewportShowExpand: true,
+          viewportShowSelectionMode: false,
+          viewportShowAnimation: false,
+          viewportBackgroundColor: backgroundColor,
+        }});
+        await viewer.loadStructureFromData(pdbText, 'pdb', {{
+          dataLabel: loadLabel,
+        }});
+        await applySignedResidueOverpaint(viewer);
+        setStatus('');
+      }} catch (error) {{
+        console.error('Mol* viewer initialization failed.', error);
+        setStatus(`Mol* viewer initialization failed: ${{error?.message ?? error}}`);
+      }}
+    }}
+
+    initialiseViewer();
+  </script>
+</body>
+</html>
+"""
+    html_path.write_text(html_text)
+
+
+def _write_wildtype_overlay_molstar_html(
+    pdb_path: Path,
+    html_path: Path,
+    title: str,
+    subtitle: str,
+    structure_entries: list[dict[str, object]],
+    viewer_height_px: int = 560,
+    footer_note: str | None = None,
+) -> None:
+    html_path.parent.mkdir(parents=True, exist_ok=True)
+
+    pdb_text = Path(pdb_path).read_text()
+    chain_payloads = []
+    legend_items = []
+    for structure_entry in structure_entries:
+        residue_color_map = {
+            int(residue_number): str(color_hex)
+            for residue_number, color_hex in (
+                structure_entry.get("residue_color_map") or {}
+            ).items()
+        }
+        grouped_residue_colors: dict[str, list[int]] = {}
+        for residue_number, color_hex in residue_color_map.items():
+            grouped_residue_colors.setdefault(color_hex, []).append(int(residue_number))
+        grouped_residue_colors = {
+            color_hex: sorted(residue_numbers)
+            for color_hex, residue_numbers in grouped_residue_colors.items()
+        }
+        all_residue_numbers = [
+            int(residue_number)
+            for residue_number in structure_entry.get("all_residue_numbers", [])
+        ]
+        neutral_residue_numbers = [
+            residue_number
+            for residue_number in all_residue_numbers
+            if residue_number not in residue_color_map
+        ]
+
+        chain_payloads.append(
+            {
+                "chainId": str(structure_entry["chain_id"]),
+                "label": str(structure_entry["label"]),
+                "defaultColor": str(structure_entry["default_color"]),
+                "neutralColor": str(structure_entry.get("neutral_color", "#d9dde3")),
+                "allResidueNumbers": all_residue_numbers,
+                "neutralResidueNumbers": neutral_residue_numbers,
+                "groupedResidueColors": grouped_residue_colors,
+            }
+        )
+        legend_items.append(
+            (
+                str(structure_entry["label"]),
+                str(structure_entry["default_color"]),
+            )
+        )
+
+    legend_html = "".join(
+        (
+            '<div class="structure-chip">'
+            f'<span class="swatch" style="background:{html.escape(color_hex)};"></span>'
+            f"<span>{html.escape(label)}</span>"
+            "</div>"
+        )
+        for label, color_hex in legend_items
+    )
+    resolved_footer_note = (
+        footer_note
+        or "The current colors only distinguish the three aligned WT structures."
+    )
+
+    html_text = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{html.escape(title)}</title>
+  <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/molstar@5.10.1/build/viewer/molstar.css" />
+  <style>
+    body {{
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f5f6f8;
+      color: #101418;
+    }}
+    .wrap {{
+      display: grid;
+      grid-template-rows: auto auto 1fr auto;
+      min-height: 100vh;
+    }}
+    .header, .footer {{
+      padding: 14px 18px;
+      background: #ffffff;
+      box-shadow: 0 1px 0 rgba(16, 20, 24, 0.08);
+    }}
+    .header h1 {{
+      margin: 0 0 6px 0;
+      font-size: 16px;
+    }}
+    .header p, .footer p {{
+      margin: 0;
+      font-size: 12px;
+      line-height: 1.45;
+      color: #46515c;
+    }}
+    .structure-legend {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+      padding: 10px 18px 12px 18px;
+      background: #ffffff;
+      border-top: 1px solid rgba(16, 20, 24, 0.08);
+    }}
+    .structure-chip {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: #27313b;
+    }}
+    .swatch {{
+      width: 12px;
+      height: 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(16, 20, 24, 0.18);
+      flex: 0 0 auto;
+    }}
+    #app {{
+      position: relative;
+      width: 100%;
+      height: {int(viewer_height_px)}px;
+    }}
+    #app :is(.msp-plugin, .msp-layout-standard, .msp-layout-expanded) {{
+      min-height: {int(viewer_height_px)}px;
+    }}
+    #status {{
+      margin: 12px 18px 0 18px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      background: #eef5ff;
+      border: 1px solid #c8dcff;
+      color: #1c3f76;
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+    }}
+    #status[data-state="hidden"] {{
+      display: none;
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="header">
+      <h1>{html.escape(title)}</h1>
+      <p>{html.escape(subtitle)}</p>
+    </div>
+    <div class="structure-legend">{legend_html}</div>
+    <div id="status">Loading aligned wildtype structures...</div>
+    <div id="app"></div>
+    <div class="footer">
+      <p>{html.escape(resolved_footer_note)}</p>
+    </div>
+  </div>
+  <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/molstar@5.10.1/build/viewer/molstar.js"></script>
+  <script type="text/javascript">
+    const pdbText = {json.dumps(pdb_text)};
+    const chainPayloads = {json.dumps(chain_payloads, sort_keys=True)};
+    const statusEl = document.getElementById('status');
+    const backgroundColor = 0xf5f6f8;
+    const loadLabel = {json.dumps(title)};
+    const MolstarLib = window.molstar?.lib;
+
+    function setStatus(message) {{
+      if (!statusEl) return;
+      if (!message) {{
+        statusEl.textContent = '';
+        statusEl.dataset.state = 'hidden';
+        return;
+      }}
+      statusEl.textContent = message;
+      delete statusEl.dataset.state;
+    }}
+
+    function colorHexToMolstarInt(colorHex) {{
+      return Number.parseInt(String(colorHex).replace('#', ''), 16);
+    }}
+
+    function buildSelectionLoci(structure, chainId, residueNumbers) {{
+      const root = structure.root ?? structure;
+      const schemaCandidates = [];
+      if (Array.isArray(residueNumbers) && residueNumbers.length) {{
+        schemaCandidates.push({{ auth_asym_id: chainId, auth_seq_id: residueNumbers }});
+        schemaCandidates.push({{ label_asym_id: chainId, auth_seq_id: residueNumbers }});
+        schemaCandidates.push({{ auth_asym_id: chainId, label_seq_id: residueNumbers }});
+        schemaCandidates.push({{ label_asym_id: chainId, label_seq_id: residueNumbers }});
+      }} else {{
+        schemaCandidates.push({{ auth_asym_id: chainId }});
+        schemaCandidates.push({{ label_asym_id: chainId }});
+      }}
+      for (const items of schemaCandidates) {{
+        const loci = MolstarLib.structure.StructureElement.Loci.fromSchema(root, {{ items }});
+        if (loci?.elements?.length) {{
+          return loci;
+        }}
+      }}
+      return null;
+    }}
+
+    function buildLayerDefs(payload) {{
+      const groupedResidueColors = payload.groupedResidueColors ?? {{}};
+      const hasResidueColors = Object.keys(groupedResidueColors).length > 0;
+      const layerDefs = [];
+      if (!hasResidueColors) {{
+        if (payload.chainId) {{
+          layerDefs.push({{
+            chainId: payload.chainId,
+            residueNumbers: null,
+            color: colorHexToMolstarInt(payload.defaultColor),
+          }});
+        }}
+        return layerDefs;
+      }}
+
+      if (Array.isArray(payload.neutralResidueNumbers) && payload.neutralResidueNumbers.length) {{
+        layerDefs.push({{
+          chainId: payload.chainId,
+          residueNumbers: payload.neutralResidueNumbers,
+          color: colorHexToMolstarInt(payload.neutralColor),
+        }});
+      }}
+      for (const [colorHex, residueNumbers] of Object.entries(groupedResidueColors)) {{
+        if (!Array.isArray(residueNumbers) || !residueNumbers.length) continue;
+        layerDefs.push({{
+          chainId: payload.chainId,
+          residueNumbers: residueNumbers,
+          color: colorHexToMolstarInt(colorHex),
+        }});
+      }}
+      return layerDefs;
+    }}
+
+    async function applyStructureOverpaint(viewer) {{
+      const structures = viewer.plugin.managers.structure.hierarchy.current.structures ?? [];
+      if (!structures.length) return;
+
+      const structureRef = structures[0];
+      const update = viewer.plugin.state.data.build();
+      for (let index = 0; index < chainPayloads.length; index += 1) {{
+        const payload = chainPayloads[index];
+        const layerDefs = buildLayerDefs(payload);
+        if (!layerDefs.length) continue;
+
+        for (const representationRef of structureRef.representations) {{
+          const structure = representationRef.cell.obj?.data?.sourceData;
+          if (!structure) continue;
+
+          const bundleLayers = [];
+          for (const layerDef of layerDefs) {{
+            const loci = buildSelectionLoci(
+              structure,
+              layerDef.chainId,
+              layerDef.residueNumbers,
+            );
+            if (!loci) continue;
+            bundleLayers.push({{
+              bundle: MolstarLib.structure.StructureElement.Bundle.fromLoci(loci),
+              color: layerDef.color,
+              clear: false,
+            }});
+          }}
+          if (!bundleLayers.length) continue;
+
+          update.to(representationRef.cell.transform.ref).apply(
+            MolstarLib.plugin.StateTransforms.Representation.OverpaintStructureRepresentation3DFromBundle,
+            {{
+              layers: bundleLayers,
+            }},
+            {{ tags: `wt-overlay-${{index}}` }},
+          );
+        }}
+      }}
+
+      await update.commit({{ doNotUpdateCurrent: true }});
+    }}
+
+    async function initialiseViewer() {{
+      if (!window.molstar?.Viewer?.create || !MolstarLib?.structure?.StructureElement || !MolstarLib?.plugin?.StateTransforms) {{
+        setStatus('Mol* loaded incompletely from the CDN. The standard viewer APIs are unavailable in this page.');
+        return;
+      }}
+
+      try {{
+        const viewer = await molstar.Viewer.create('app', {{
+          layoutIsExpanded: true,
+          layoutShowControls: true,
+          layoutShowRemoteState: false,
+          layoutShowSequence: true,
+          layoutShowLog: false,
+          layoutShowLeftPanel: true,
+          viewportShowExpand: true,
+          viewportShowSelectionMode: false,
+          viewportShowAnimation: false,
+          viewportBackgroundColor: backgroundColor,
+        }});
+        await viewer.loadStructureFromData(pdbText, 'pdb', {{
+          dataLabel: loadLabel,
+        }});
+        await applyStructureOverpaint(viewer);
+        setStatus('');
+      }} catch (error) {{
+        console.error('Mol* WT overlay initialization failed.', error);
+        setStatus(`Mol* WT overlay initialization failed: ${{error?.message ?? error}}`);
+      }}
+    }}
+
+    initialiseViewer();
+  </script>
+</body>
+</html>
+"""
+    html_path.write_text(html_text)
+
+
+def export_wildtype_overlay_molstar_views(
+    structure_family_df: pd.DataFrame,
+    output_dir: Path,
+    metrics: Iterable[str] = ("rmsf", "residue_contacts", "saltbridge_pairs"),
+    viewer_height_px: int = 560,
+    reference_family_id: str | None = None,
+    structure_color_map: dict[str, str] | None = None,
+) -> WildtypeMolstarOverlayExportBundle:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    wildtype_structure_df = (
+        structure_family_df.loc[
+            structure_family_df["is_wildtype"],
+            ["family_id", "sample_name", "pdb_path"],
+        ]
+        .sort_values("family_id")
+        .reset_index(drop=True)
+    )
+    if wildtype_structure_df.empty:
+        return WildtypeMolstarOverlayExportBundle(
+            viewer_index_df=pd.DataFrame(),
+            alignment_summary_df=pd.DataFrame(),
+        )
+
+    resolved_reference_family_id = (
+        str(reference_family_id)
+        if reference_family_id is not None
+        else str(wildtype_structure_df.iloc[0]["family_id"])
+    )
+    reference_match_df = wildtype_structure_df.loc[
+        wildtype_structure_df["family_id"].eq(resolved_reference_family_id)
+    ]
+    if reference_match_df.empty:
+        raise KeyError(
+            "Requested WT overlay reference family was not found among the wildtype structures: "
+            f"{resolved_reference_family_id}"
+        )
+    reference_row = reference_match_df.iloc[0]
+    reference_trace = parse_ca_trace(Path(reference_row["pdb_path"]))
+
+    metric_alias_map = {
+        "rmsf": "rmsf",
+        "contact": "residue_contacts",
+        "contacts": "residue_contacts",
+        "residue_contacts": "residue_contacts",
+        "saltbridge": "saltbridge_pairs",
+        "saltbridges": "saltbridge_pairs",
+        "salt_bridge": "saltbridge_pairs",
+        "salt_bridges": "saltbridge_pairs",
+        "saltbridge_pairs": "saltbridge_pairs",
+    }
+    metric_label_map = {
+        "rmsf": "RMSF",
+        "residue_contacts": "Residue contacts",
+        "saltbridge_pairs": "Salt bridges",
+    }
+    resolved_metrics = []
+    for metric_name in metrics:
+        metric_key = str(metric_name).strip().lower()
+        resolved_metric_name = metric_alias_map.get(metric_key, metric_key)
+        if resolved_metric_name not in metric_label_map:
+            raise KeyError(
+                "Unsupported WT Mol* overlay metric. Expected one of "
+                "'rmsf', 'residue_contacts', or 'saltbridge_pairs'."
+            )
+        resolved_metrics.append(resolved_metric_name)
+
+    default_palette = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#8c564b", "#17becf"]
+    structure_color_map = dict(structure_color_map or {})
+    available_chain_ids = list("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
+
+    aligned_structure_rows = []
+    structure_entries = []
+    aligned_structure_dir = output_dir / "aligned_wildtypes"
+    aligned_structure_dir.mkdir(parents=True, exist_ok=True)
+    trace_cache = {
+        str(row.family_id): parse_ca_trace(Path(row.pdb_path))
+        for row in wildtype_structure_df.itertuples(index=False)
+    }
+
+    for structure_index, row in enumerate(wildtype_structure_df.itertuples(index=False)):
+        family_id = str(row.family_id)
+        structure_label = f"{family_id} WT"
+        chain_id = available_chain_ids[structure_index % len(available_chain_ids)]
+        aligned_pdb_path = aligned_structure_dir / f"{family_id}_aligned_to_{resolved_reference_family_id}.pdb"
+        residue_numbers = (
+            trace_cache[family_id]["residue_number"]
+            .dropna()
+            .astype(int)
+            .drop_duplicates()
+            .tolist()
+        )
+        default_color = structure_color_map.get(
+            family_id,
+            default_palette[structure_index % len(default_palette)],
+        )
+
+        if family_id == resolved_reference_family_id:
+            _write_transformed_pdb(
+                template_pdb_path=Path(row.pdb_path),
+                output_path=aligned_pdb_path,
+            )
+            alignment_row = {
+                "family_id": family_id,
+                "sample_name": str(row.sample_name),
+                "reference_family_id": resolved_reference_family_id,
+                "alignment_method": "reference_identity",
+                "aligned_length": int(len(reference_trace)),
+                "rmsd_angstrom": 0.0,
+                "seq_identity_aligned": 1.0,
+                "tm_score_to_reference": 1.0,
+                "aligned_fraction_to_reference": 1.0,
+            }
+        else:
+            alignment_result = compute_ca_superposition_alignment(
+                structure_a_trace=reference_trace,
+                structure_b_trace=trace_cache[family_id],
+            )
+            _write_transformed_pdb(
+                template_pdb_path=Path(row.pdb_path),
+                output_path=aligned_pdb_path,
+                rotation_matrix=np.asarray(alignment_result["rotation_matrix"], dtype=float),
+                mobile_center=np.asarray(alignment_result["mobile_center"], dtype=float),
+                reference_center=np.asarray(alignment_result["reference_center"], dtype=float),
+            )
+            alignment_row = {
+                "family_id": family_id,
+                "sample_name": str(row.sample_name),
+                "reference_family_id": resolved_reference_family_id,
+                "alignment_method": "ca_superposition",
+                "aligned_length": int(alignment_result["aligned_length"]),
+                "rmsd_angstrom": float(alignment_result["rmsd_angstrom"]),
+                "seq_identity_aligned": float(alignment_result["seq_identity_aligned"]),
+                "tm_score_to_reference": float(alignment_result["tm_score_to_structure_a"]),
+                "aligned_fraction_to_reference": float(
+                    alignment_result["aligned_fraction_to_structure_a"]
+                ),
+            }
+
+        alignment_row["default_color"] = default_color
+        alignment_row["chain_id"] = chain_id
+        alignment_row["aligned_pdb_path"] = aligned_pdb_path
+        aligned_structure_rows.append(alignment_row)
+        structure_entries.append(
+            {
+                "family_id": family_id,
+                "chain_id": chain_id,
+                "label": structure_label,
+                "pdb_path": aligned_pdb_path,
+                "default_color": default_color,
+                "all_residue_numbers": residue_numbers,
+                "residue_color_map": {},
+            }
+        )
+
+    alignment_summary_df = pd.DataFrame(aligned_structure_rows)
+    if not alignment_summary_df.empty:
+        alignment_summary_df.to_csv(output_dir / "wildtype_alignment_summary.csv", index=False)
+
+    combined_structure_dir = output_dir / "combined_wildtypes"
+    combined_structure_dir.mkdir(parents=True, exist_ok=True)
+    combined_pdb_path = (
+        combined_structure_dir / f"wildtype_overlay_aligned_to_{resolved_reference_family_id}.pdb"
+    )
+    _write_combined_overlay_pdb(
+        structure_entries=structure_entries,
+        output_path=combined_pdb_path,
+    )
+
+    viewer_rows = []
+    ordered_family_ids = [str(entry["family_id"]) for entry in structure_entries]
+    for metric_name in resolved_metrics:
+        metric_label = metric_label_map[metric_name]
+        metric_output_dir = output_dir / metric_name
+        metric_output_dir.mkdir(parents=True, exist_ok=True)
+        html_output_path = metric_output_dir / f"wildtype_overlay_{metric_name}.html"
+        footer_note = (
+            f"All structures are aligned to {resolved_reference_family_id} on matched CA atoms. "
+            f"These colors only distinguish the WT backbones; per-residue {metric_label.lower()} coloring can be layered on next."
+        )
+        _write_wildtype_overlay_molstar_html(
+            pdb_path=combined_pdb_path,
+            html_path=html_output_path,
+            title=f"Wildtype Overlay: {metric_label}",
+            subtitle=(
+                f"{len(structure_entries)} wildtype structures aligned to {resolved_reference_family_id} "
+                f"and superimposed for the {metric_label} view."
+            ),
+            structure_entries=structure_entries,
+            viewer_height_px=viewer_height_px,
+            footer_note=footer_note,
+        )
+        viewer_rows.append(
+            {
+                "metric_name": metric_name,
+                "metric_label": metric_label,
+                "reference_family_id": resolved_reference_family_id,
+                "wildtype_count": int(len(structure_entries)),
+                "family_order": " | ".join(ordered_family_ids),
+                "pdb_path": combined_pdb_path,
+                "html_path": html_output_path,
+            }
+        )
+
+    viewer_index_df = pd.DataFrame(viewer_rows)
+    if not viewer_index_df.empty:
+        viewer_index_df.to_csv(output_dir / "wildtype_overlay_viewer_index.csv", index=False)
+
+    return WildtypeMolstarOverlayExportBundle(
+        viewer_index_df=viewer_index_df,
+        alignment_summary_df=alignment_summary_df,
+    )
+
+
+def export_wildtype_superposition_molstar_view(
+    structure_family_df: pd.DataFrame,
+    output_dir: Path,
+    viewer_height_px: int = 560,
+    reference_family_id: str | None = None,
+) -> WildtypeMolstarSuperpositionExport:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    wildtype_structure_df = (
+        structure_family_df.loc[
+            structure_family_df["is_wildtype"],
+            ["family_id", "sample_name", "pdb_path"],
+        ]
+        .sort_values("family_id")
+        .reset_index(drop=True)
+    )
+    if wildtype_structure_df.empty:
+        raise ValueError("No wildtype structures were found for WT Mol* superposition export.")
+
+    resolved_reference_family_id = (
+        str(reference_family_id)
+        if reference_family_id is not None
+        else str(wildtype_structure_df.iloc[0]["family_id"])
+    )
+    reference_match_df = wildtype_structure_df.loc[
+        wildtype_structure_df["family_id"].eq(resolved_reference_family_id)
+    ]
+    if reference_match_df.empty:
+        raise KeyError(
+            "Requested WT superposition reference family was not found among the wildtype structures: "
+            f"{resolved_reference_family_id}"
+        )
+
+    reference_row = reference_match_df.iloc[0]
+    reference_trace = parse_ca_trace(Path(reference_row["pdb_path"]))
+    available_chain_ids = list("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
+
+    aligned_structure_rows = []
+    structure_entries = []
+    aligned_structure_dir = output_dir / "aligned_wildtypes"
+    aligned_structure_dir.mkdir(parents=True, exist_ok=True)
+    trace_cache = {
+        str(row.family_id): parse_ca_trace(Path(row.pdb_path))
+        for row in wildtype_structure_df.itertuples(index=False)
+    }
+
+    for structure_index, row in enumerate(wildtype_structure_df.itertuples(index=False)):
+        family_id = str(row.family_id)
+        chain_id = available_chain_ids[structure_index % len(available_chain_ids)]
+        aligned_pdb_path = aligned_structure_dir / f"{family_id}_aligned_to_{resolved_reference_family_id}.pdb"
+        residue_numbers = (
+            trace_cache[family_id]["residue_number"]
+            .dropna()
+            .astype(int)
+            .drop_duplicates()
+            .tolist()
+        )
+
+        if family_id == resolved_reference_family_id:
+            _write_transformed_pdb(
+                template_pdb_path=Path(row.pdb_path),
+                output_path=aligned_pdb_path,
+            )
+            alignment_row = {
+                "family_id": family_id,
+                "sample_name": str(row.sample_name),
+                "reference_family_id": resolved_reference_family_id,
+                "alignment_method": "reference_identity",
+                "aligned_length": int(len(reference_trace)),
+                "rmsd_angstrom": 0.0,
+                "seq_identity_aligned": 1.0,
+                "tm_score_to_reference": 1.0,
+                "aligned_fraction_to_reference": 1.0,
+            }
+        else:
+            alignment_result = compute_ca_superposition_alignment(
+                structure_a_trace=reference_trace,
+                structure_b_trace=trace_cache[family_id],
+            )
+            _write_transformed_pdb(
+                template_pdb_path=Path(row.pdb_path),
+                output_path=aligned_pdb_path,
+                rotation_matrix=np.asarray(alignment_result["rotation_matrix"], dtype=float),
+                mobile_center=np.asarray(alignment_result["mobile_center"], dtype=float),
+                reference_center=np.asarray(alignment_result["reference_center"], dtype=float),
+            )
+            alignment_row = {
+                "family_id": family_id,
+                "sample_name": str(row.sample_name),
+                "reference_family_id": resolved_reference_family_id,
+                "alignment_method": "ca_superposition",
+                "aligned_length": int(alignment_result["aligned_length"]),
+                "rmsd_angstrom": float(alignment_result["rmsd_angstrom"]),
+                "seq_identity_aligned": float(alignment_result["seq_identity_aligned"]),
+                "tm_score_to_reference": float(alignment_result["tm_score_to_structure_a"]),
+                "aligned_fraction_to_reference": float(
+                    alignment_result["aligned_fraction_to_structure_a"]
+                ),
+            }
+
+        alignment_row["chain_id"] = chain_id
+        alignment_row["aligned_pdb_path"] = aligned_pdb_path
+        aligned_structure_rows.append(alignment_row)
+        structure_entries.append(
+            {
+                "family_id": family_id,
+                "chain_id": chain_id,
+                "label": family_id,
+                "pdb_path": aligned_pdb_path,
+                "all_residue_numbers": residue_numbers,
+            }
+        )
+
+    alignment_summary_df = pd.DataFrame(aligned_structure_rows)
+    alignment_summary_df.to_csv(output_dir / "wildtype_superposition_alignment_summary.csv", index=False)
+
+    combined_pdb_path = output_dir / f"wildtype_superposition_aligned_to_{resolved_reference_family_id}.pdb"
+    _write_combined_overlay_pdb(
+        structure_entries=structure_entries,
+        output_path=combined_pdb_path,
+    )
+
+    html_path = output_dir / "wildtype_superposition.html"
+    _write_simple_molstar_html(
+        pdb_path=combined_pdb_path,
+        html_path=html_path,
+        title="Wildtype Structural Superposition",
+        subtitle=(
+            f"Three wildtype structures aligned to {resolved_reference_family_id} and loaded as one combined PDB."
+        ),
+        viewer_height_px=viewer_height_px,
+        footer_note=(
+            "This is a minimal restart of the WT Mol* workflow: one aligned combined PDB, one standard Mol* load."
+        ),
+    )
+
+    return WildtypeMolstarSuperpositionExport(
+        html_path=html_path,
+        pdb_path=combined_pdb_path,
+        alignment_summary_df=alignment_summary_df,
+    )
+
+
+def export_md_variant_molstar_views(
+    structure_family_df: pd.DataFrame,
+    md_variant_bundle: MDVariantAnalysisBundle,
+    metric_dir: Path,
+    output_dir: Path,
+    metrics: Iterable[str] = ("rmsf", "rmsd", "hbond_pairs", "saltbridge_pairs"),
+    z_threshold: float = 1.5,
+    viewer_height_px: int = 560,
+) -> MDVariantMolstarExportBundle:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    wildtype_structure_df = structure_family_df.loc[
+        structure_family_df["is_wildtype"]
+    ].copy()
+    wildtype_structure_lookup = {
+        str(row.family_id): Path(row.pdb_path)
+        for row in wildtype_structure_df.itertuples(index=False)
+    }
+
+    residue_score_tables = []
+    metric_alias_map = {
+        "rmsf": "rmsf",
+        "rmsd": "rmsd",
+        "hhbond": "hbond_pairs",
+        "hhbonds": "hbond_pairs",
+        "hbond": "hbond_pairs",
+        "hbonds": "hbond_pairs",
+        "hbond_pairs": "hbond_pairs",
+        "saltbridge": "saltbridge_pairs",
+        "saltbridges": "saltbridge_pairs",
+        "saltbridge_pairs": "saltbridge_pairs",
+    }
+    metric_names = [
+        metric_alias_map.get(str(metric_name).strip().lower(), str(metric_name).strip().lower())
+        for metric_name in metrics
+    ]
+
+    for metric_name in metric_names:
+        if metric_name == "rmsd":
+            continue
+        for family_id in md_variant_bundle.family_ids:
+            residue_score_table = build_md_variant_molstar_residue_score_table(
+                md_variant_bundle=md_variant_bundle,
+                family_id=family_id,
+                metric_name=metric_name,
+                z_threshold=z_threshold,
+            )
+            if not residue_score_table.empty:
+                residue_score_tables.append(residue_score_table)
+
+    score_table_df = (
+        pd.concat(residue_score_tables, ignore_index=True)
+        if residue_score_tables
+        else pd.DataFrame()
+    )
+    global_rmsd_summary_df = build_md_variant_global_rmsd_score_table(
+        md_variant_bundle=md_variant_bundle,
+        metric_dir=metric_dir,
+    )
+
+    if not score_table_df.empty:
+        score_table_df.to_csv(output_dir / "molstar_residue_metric_scores.csv", index=False)
+    if not global_rmsd_summary_df.empty:
+        global_rmsd_summary_df.to_csv(
+            output_dir / "molstar_global_rmsd_scores.csv",
+            index=False,
+        )
+
+    metric_label_map = {
+        "rmsf": "RMSF",
+        "rmsd": "RMSD",
+        "hbond_pairs": "Hydrogen bonds",
+        "saltbridge_pairs": "Salt bridges",
+    }
+
+    viewer_rows = []
+    for family_id in md_variant_bundle.family_ids:
+        wildtype_pdb_path = wildtype_structure_lookup.get(str(family_id))
+        if wildtype_pdb_path is None:
+            continue
+
+        all_residue_numbers = (
+            parse_ca_trace(wildtype_pdb_path)["residue_number"]
+            .dropna()
+            .astype(int)
+            .drop_duplicates()
+            .tolist()
+        )
+        family_output_dir = output_dir / str(family_id)
+        family_output_dir.mkdir(parents=True, exist_ok=True)
+
+        family_metric_tables = {}
+        if not score_table_df.empty:
+            for metric_name in {"rmsf", "hbond_pairs", "saltbridge_pairs"}:
+                family_metric_tables[metric_name] = score_table_df.loc[
+                    score_table_df["family"].eq(family_id)
+                    & score_table_df["metric_name"].eq(metric_name)
+                ].copy()
+
+        family_global_rmsd_df = global_rmsd_summary_df.loc[
+            global_rmsd_summary_df["family"].eq(family_id)
+        ].copy()
+
+        variant_systems = compute_md_variant_order(md_variant_bundle.metadata_df, family_id)
+        for variant_system in variant_systems:
+            variant_metadata_df = md_variant_bundle.metadata_df.loc[
+                md_variant_bundle.metadata_df["system"].eq(variant_system)
+            ]
+            if variant_metadata_df.empty:
+                continue
+            variant_label = get_md_variant_display_label(
+                md_variant_bundle.metadata_df,
+                variant_system,
+            )
+
+            for metric_name in metric_names:
+                if metric_name == "rmsd":
+                    metric_variant_df = family_global_rmsd_df.loc[
+                        family_global_rmsd_df["system"].eq(variant_system)
+                    ].copy()
+                else:
+                    metric_table_df = family_metric_tables.get(metric_name, pd.DataFrame())
+                    if metric_table_df.empty or "variant_system" not in metric_table_df.columns:
+                        continue
+                    metric_variant_df = metric_table_df.loc[
+                        metric_table_df["variant_system"].eq(variant_system)
+                    ].copy()
+                if metric_variant_df.empty:
+                    continue
+
+                metric_output_dir = family_output_dir / metric_name / str(variant_system)
+                metric_output_dir.mkdir(parents=True, exist_ok=True)
+
+                if metric_name == "rmsd":
+                    score_row = metric_variant_df.iloc[0]
+                    score_z = float(score_row["score_z"])
+                    abs_score_z = float(score_row["abs_score_z"])
+                    passes_threshold = abs_score_z >= float(z_threshold)
+                    signed_score_value = float(np.clip(score_z, -99.99, 99.99)) if passes_threshold else 0.0
+                    signed_residue_score_map = {
+                        int(residue_number): signed_score_value
+                        for residue_number in all_residue_numbers
+                    }
+                    positive_residue_count = (
+                        len(all_residue_numbers)
+                        if passes_threshold and score_z > 0
+                        else 0
+                    )
+                    negative_residue_count = (
+                        len(all_residue_numbers)
+                        if passes_threshold and score_z < 0
+                        else 0
+                    )
+                    metric_variant_df = pd.DataFrame(
+                        {
+                            "family": [family_id],
+                            "variant_system": [variant_system],
+                            "variant_label": [variant_label],
+                            "metric_name": ["rmsd"],
+                            "metric_label": ["RMSD"],
+                            "residues_colored_positive": [positive_residue_count],
+                            "residues_colored_negative": [negative_residue_count],
+                            "delta_global_rmsd": [float(score_row["delta_global_rmsd"])],
+                            "score_z": [score_z],
+                            "abs_score_z": [abs_score_z],
+                            "z_threshold": [float(z_threshold)],
+                        }
+                    )
+                else:
+                    signed_residue_score_map = {
+                        int(row.resid): (
+                            float(np.clip(float(row.score_z), -99.99, 99.99))
+                            if bool(row.passes_threshold)
+                            else 0.0
+                        )
+                        for row in metric_variant_df.itertuples(index=False)
+                    }
+                    positive_residue_count = int(
+                        metric_variant_df["direction"].eq("positive").sum()
+                    )
+                    negative_residue_count = int(
+                        metric_variant_df["direction"].eq("negative").sum()
+                    )
+                    metric_variant_df.to_csv(
+                        metric_output_dir / f"{variant_system}_{metric_name}_residue_scores.csv",
+                        index=False,
+                    )
+
+                score_limit = float(
+                    max(
+                        metric_variant_df["abs_score_z"].max()
+                        if "abs_score_z" in metric_variant_df.columns
+                        else 0.0,
+                        float(z_threshold),
+                    )
+                )
+                residue_color_map, score_limit = _build_md_variant_residue_color_map(
+                    residue_score_map=signed_residue_score_map,
+                    z_threshold=z_threshold,
+                    score_limit=score_limit,
+                )
+
+                pdb_output_path = (
+                    metric_output_dir
+                    / f"{variant_system}_{metric_name}_signed_z{float(z_threshold):0.1f}.pdb"
+                )
+                html_output_path = (
+                    metric_output_dir
+                    / f"{variant_system}_{metric_name}_signed_z{float(z_threshold):0.1f}.html"
+                )
+                _write_md_variant_bfactor_pdb(
+                    template_pdb_path=wildtype_pdb_path,
+                    residue_bfactor_map=signed_residue_score_map,
+                    output_path=pdb_output_path,
+                )
+                subtitle = (
+                    f"{family_id} | {variant_label} | {metric_label_map[metric_name]} | "
+                    f"Blue = lower than WT, red = higher than WT, gray = |z| < {float(z_threshold):0.1f}."
+                )
+                _write_md_variant_molstar_html(
+                    pdb_path=pdb_output_path,
+                    html_path=html_output_path,
+                    title=f"{variant_label}: {metric_label_map[metric_name]} Signed WT Delta",
+                    subtitle=subtitle,
+                    residue_color_map=residue_color_map,
+                    all_residue_numbers=all_residue_numbers,
+                    score_limit=score_limit,
+                    viewer_height_px=viewer_height_px,
+                )
+
+                viewer_rows.append(
+                    {
+                        "family": family_id,
+                        "variant_system": variant_system,
+                        "variant_label": variant_label,
+                        "metric_name": metric_name,
+                        "metric_label": metric_label_map[metric_name],
+                        "direction": "signed",
+                        "direction_label": "Signed WT delta",
+                        "z_threshold": float(z_threshold),
+                        "positive_residue_count": int(positive_residue_count),
+                        "negative_residue_count": int(negative_residue_count),
+                        "colored_residue_count": int(len(residue_color_map)),
+                        "pdb_path": pdb_output_path,
+                        "html_path": html_output_path,
+                    }
+                )
+
+    viewer_index_df = pd.DataFrame(viewer_rows)
+    if not viewer_index_df.empty:
+        viewer_index_df.to_csv(output_dir / "molstar_viewer_index.csv", index=False)
+
+    return MDVariantMolstarExportBundle(
+        viewer_index_df=viewer_index_df,
+        score_table_df=score_table_df,
+        global_rmsd_summary_df=global_rmsd_summary_df,
+    )
+
+
+def _compress_residue_numbers_to_ranges(residue_numbers: Iterable[int]) -> str:
+    ordered_residue_numbers = sorted(
+        {
+            int(residue_number)
+            for residue_number in residue_numbers
+            if pd.notna(residue_number)
+        }
+    )
+    if not ordered_residue_numbers:
+        return ""
+
+    range_tokens = []
+    start_residue = ordered_residue_numbers[0]
+    previous_residue = ordered_residue_numbers[0]
+
+    for residue_number in ordered_residue_numbers[1:]:
+        if residue_number == previous_residue + 1:
+            previous_residue = residue_number
+            continue
+
+        if start_residue == previous_residue:
+            range_tokens.append(str(start_residue))
+        else:
+            range_tokens.append(f"{start_residue}-{previous_residue}")
+        start_residue = residue_number
+        previous_residue = residue_number
+
+    if start_residue == previous_residue:
+        range_tokens.append(str(start_residue))
+    else:
+        range_tokens.append(f"{start_residue}-{previous_residue}")
+    return ",".join(range_tokens)
+
+
+def _resolve_wildtype_chimerax_metric_name(metric_name: str) -> str:
+    metric_alias_map = {
+        "rmsf": "rmsf",
+        "interaction_change": "interaction_change",
+        "combined_interaction_change": "interaction_change",
+        "interaction_changes": "interaction_change",
+        "combined_interactions": "interaction_change",
+        "hhbond": "hbond_pairs",
+        "hhbonds": "hbond_pairs",
+        "hbond": "hbond_pairs",
+        "hbonds": "hbond_pairs",
+        "hbond_pairs": "hbond_pairs",
+        "saltbridge": "saltbridge_pairs",
+        "saltbridges": "saltbridge_pairs",
+        "saltbridge_pairs": "saltbridge_pairs",
+    }
+    resolved_metric_name = metric_alias_map.get(
+        str(metric_name).strip().lower(),
+        str(metric_name).strip().lower(),
+    )
+    if resolved_metric_name not in {"rmsf", "interaction_change", "hbond_pairs", "saltbridge_pairs"}:
+        raise KeyError(
+            "Unsupported WT ChimeraX metric. Expected one of "
+            "'rmsf', 'interaction_change', 'hbond_pairs', or 'saltbridge_pairs'."
+        )
+    return resolved_metric_name
+
+
+def _normalize_chimerax_model_id(model_id: str) -> str:
+    model_id_text = str(model_id).strip()
+    if not model_id_text:
+        raise ValueError("ChimeraX model ids must not be empty.")
+    return model_id_text if model_id_text.startswith("#") else f"#{model_id_text}"
+
+
+def _normalize_signed_z_breaks(signed_z_breaks: Iterable[float]) -> tuple[float, ...]:
+    normalized_breaks = tuple(
+        sorted(
+            {
+                float(break_value)
+                for break_value in signed_z_breaks
+                if pd.notna(break_value) and float(break_value) > 0.0
+            }
+        )
+    )
+    if not normalized_breaks:
+        raise ValueError("At least one positive signed z-score break is required.")
+    return normalized_breaks
+
+
+DEFAULT_CHIMERAX_INTERACTION_COLORS = {
+    "saltbridge_gain": ("#D55E00",),
+    "saltbridge_loss": ("#007A5E",),
+    "hbond_gain": ("#0072B2",),
+    "hbond_loss": ("#B88600",),
+}
+
+
+def _normalize_chimerax_interaction_colors(
+    interaction_colors: dict[str, Iterable[str]] | None,
+    n_intervals: int,
+) -> dict[str, tuple[str, ...]]:
+    required_channels = tuple(DEFAULT_CHIMERAX_INTERACTION_COLORS)
+    supplied_colors = (
+        DEFAULT_CHIMERAX_INTERACTION_COLORS
+        if interaction_colors is None
+        else interaction_colors
+    )
+    missing_channels = set(required_channels).difference(supplied_colors)
+    extra_channels = set(supplied_colors).difference(required_channels)
+    if missing_channels or extra_channels:
+        raise KeyError(
+            "ChimeraX interaction colors must define exactly "
+            f"{list(required_channels)}; missing={sorted(missing_channels)}, "
+            f"unexpected={sorted(extra_channels)}."
+        )
+
+    normalized_colors: dict[str, tuple[str, ...]] = {}
+    for channel_name in required_channels:
+        channel_colors = tuple(to_hex(color_value) for color_value in supplied_colors[channel_name])
+        if len(channel_colors) != int(n_intervals):
+            raise ValueError(
+                f"ChimeraX interaction channel {channel_name!r} has "
+                f"{len(channel_colors)} colors, but {int(n_intervals)} are required "
+                "to match the z-score breaks."
+            )
+        normalized_colors[channel_name] = channel_colors
+    return normalized_colors
+
+
+def _resolve_wildtype_chimerax_target_spec_df(
+    wildtype_alignment_df: pd.DataFrame,
+    target_layout: str = "combined_model",
+    combined_model_id: str = "#1",
+    separate_model_id_by_family: dict[str, str] | None = None,
+    separate_model_chain_id: str = "A",
+) -> pd.DataFrame:
+    resolved_target_layout = str(target_layout).strip().lower()
+    if resolved_target_layout not in {"combined_model", "separate_models"}:
+        raise KeyError(
+            "Unsupported WT ChimeraX target layout. Expected one of "
+            "'combined_model' or 'separate_models'."
+        )
+
+    required_columns = {"family_id", "chain_id", "aligned_pdb_path"}
+    missing_columns = required_columns.difference(wildtype_alignment_df.columns)
+    if missing_columns:
+        raise KeyError(
+            "WT alignment summary is missing required columns for ChimeraX targeting: "
+            f"{sorted(missing_columns)}"
+        )
+
+    target_spec_df = (
+        wildtype_alignment_df.loc[:, ["family_id", "chain_id", "aligned_pdb_path"]]
+        .drop_duplicates(subset=["family_id"])
+        .sort_values(["family_id"])
+        .reset_index(drop=True)
+    )
+    if resolved_target_layout == "combined_model":
+        target_spec_df["target_model_id"] = _normalize_chimerax_model_id(combined_model_id)
+        target_spec_df["target_chain_id"] = target_spec_df["chain_id"].astype(str)
+        return target_spec_df
+
+    if separate_model_id_by_family is None:
+        separate_model_id_by_family = {
+            str(row.family_id): f"#{row_index + 1}"
+            for row_index, row in enumerate(target_spec_df.itertuples(index=False))
+        }
+
+    normalized_model_id_by_family = {
+        str(family_id): _normalize_chimerax_model_id(model_id)
+        for family_id, model_id in separate_model_id_by_family.items()
+    }
+    missing_family_ids = sorted(
+        set(target_spec_df["family_id"].astype(str)).difference(normalized_model_id_by_family)
+    )
+    if missing_family_ids:
+        raise KeyError(
+            "Separate-model ChimeraX targeting is missing model ids for WT families: "
+            f"{missing_family_ids}"
+        )
+
+    target_chain_id = str(separate_model_chain_id).strip() or "A"
+    target_spec_df["target_model_id"] = target_spec_df["family_id"].map(normalized_model_id_by_family)
+    target_spec_df["target_chain_id"] = target_chain_id
+    return target_spec_df
+
+
+def _build_wildtype_chimerax_family_average_score_table(
+    md_variant_bundle: MDVariantAnalysisBundle,
+    wildtype_alignment_df: pd.DataFrame | None,
+    metric_name: str,
+) -> pd.DataFrame:
+    resolved_metric_name = _resolve_wildtype_chimerax_metric_name(metric_name)
+
+    if wildtype_alignment_df is not None:
+        alignment_columns = {"family_id", "chain_id"}
+        missing_alignment_columns = alignment_columns.difference(wildtype_alignment_df.columns)
+        if missing_alignment_columns:
+            raise KeyError(
+                "WT alignment summary is missing required columns for ChimeraX export: "
+                f"{sorted(missing_alignment_columns)}"
+            )
+
+    metric_label_map = {
+        "rmsf": "RMSF",
+        "hbond_pairs": "Hydrogen bonds",
+        "saltbridge_pairs": "Salt bridges",
+    }
+    family_score_tables = []
+    for family_id in md_variant_bundle.family_ids:
+        family_score_df = build_md_variant_molstar_residue_score_table(
+            md_variant_bundle=md_variant_bundle,
+            family_id=family_id,
+            metric_name=resolved_metric_name,
+            z_threshold=1.5,
+        )
+        if family_score_df.empty:
+            continue
+
+        family_score_df = family_score_df.copy()
+        family_score_df["score_raw"] = pd.to_numeric(
+            family_score_df["score_raw"],
+            errors="coerce",
+        ).fillna(0.0)
+        if "gain_raw" not in family_score_df.columns:
+            family_score_df["gain_raw"] = family_score_df["score_raw"].clip(lower=0.0)
+        else:
+            family_score_df["gain_raw"] = pd.to_numeric(
+                family_score_df["gain_raw"],
+                errors="coerce",
+            ).fillna(0.0)
+        if "loss_raw" not in family_score_df.columns:
+            family_score_df["loss_raw"] = family_score_df["score_raw"].clip(upper=0.0)
+        else:
+            family_score_df["loss_raw"] = pd.to_numeric(
+                family_score_df["loss_raw"],
+                errors="coerce",
+            ).fillna(0.0)
+
+        family_average_df = (
+            family_score_df.groupby(["family", "resid", "resname"], as_index=False)
+            .agg(
+                n_variants=("variant_system", "nunique"),
+                mean_score_raw=("score_raw", "mean"),
+                mean_abs_score_raw=("score_raw", lambda values: np.mean(np.abs(values))),
+                mean_gain_raw=("gain_raw", "mean"),
+                mean_loss_raw=("loss_raw", "mean"),
+                fraction_variants_positive=(
+                    "score_raw",
+                    lambda values: np.mean(np.asarray(values, dtype=float) > 0.0),
+                ),
+                fraction_variants_negative=(
+                    "score_raw",
+                    lambda values: np.mean(np.asarray(values, dtype=float) < 0.0),
+                ),
+            )
+            .rename(columns={"family": "family_id"})
+        )
+        family_average_df["metric_name"] = resolved_metric_name
+        family_average_df["metric_label"] = metric_label_map[resolved_metric_name]
+        family_average_df["mean_score_z"] = (
+            family_average_df.groupby("family_id", group_keys=False)["mean_score_raw"]
+            .apply(_compute_md_variant_group_zscores)
+            .astype(float)
+        )
+        family_score_tables.append(family_average_df)
+
+    if not family_score_tables:
+        return pd.DataFrame(
+            columns=[
+                "family_id",
+                "chain_id",
+                "metric_name",
+                "metric_label",
+                "resid",
+                "resname",
+                "n_variants",
+                "mean_score_raw",
+                "mean_score_z",
+                "mean_abs_score_raw",
+                "mean_gain_raw",
+                "mean_loss_raw",
+                "fraction_variants_positive",
+                "fraction_variants_negative",
+            ]
+        )
+
+    aggregate_df = pd.concat(family_score_tables, ignore_index=True)
+    if wildtype_alignment_df is not None:
+        alignment_lookup_df = wildtype_alignment_df.loc[
+            :,
+            ["family_id", "chain_id"],
+        ].drop_duplicates(subset=["family_id"])
+        aggregate_df = aggregate_df.merge(
+            alignment_lookup_df,
+            on="family_id",
+            how="left",
+        )
+    return aggregate_df.sort_values(["family_id", "resid"]).reset_index(drop=True)
+
+
+def _build_md_variant_residue_replicate_matrix(
+    residue_replicate_df: pd.DataFrame,
+    system_name: str,
+    residue_numbers: Iterable[int],
+    replicate_indices: Iterable[int],
+) -> pd.DataFrame:
+    residue_index = pd.Index(sorted({int(resid) for resid in residue_numbers}), name="resid")
+    replicate_columns = [int(replicate_index) for replicate_index in replicate_indices]
+    if not len(residue_index) or not len(replicate_columns):
+        return pd.DataFrame(index=residue_index, columns=replicate_columns, dtype=float).fillna(0.0)
+
+    system_df = residue_replicate_df.loc[
+        residue_replicate_df["system"].eq(system_name)
+    ].copy()
+    if system_df.empty:
+        return pd.DataFrame(
+            0.0,
+            index=residue_index,
+            columns=replicate_columns,
+        )
+
+    system_df["replicate_index"] = pd.to_numeric(
+        system_df["replicate_index"],
+        errors="coerce",
+    ).astype("Int64")
+    system_df = system_df.dropna(subset=["replicate_index"]).copy()
+    system_df["replicate_index"] = system_df["replicate_index"].astype(int)
+
+    matrix_df = system_df.pivot_table(
+        index="resid",
+        columns="replicate_index",
+        values="occupancy_sum",
+        aggfunc="sum",
+        fill_value=0.0,
+    )
+    matrix_df.index = pd.Index(matrix_df.index.astype(int), name="resid")
+    matrix_df = matrix_df.reindex(index=residue_index, columns=replicate_columns, fill_value=0.0)
+    return matrix_df.astype(float)
+
+
+def _build_wildtype_chimerax_pair_majority_significance_score_table(
+    md_variant_bundle: MDVariantAnalysisBundle,
+    metric_name: str,
+    alpha: float = 0.05,
+    majority_fraction_threshold: float = 0.5,
+) -> pd.DataFrame:
+    resolved_metric_name = _resolve_wildtype_chimerax_metric_name(metric_name)
+    if resolved_metric_name not in {"hbond_pairs", "saltbridge_pairs"}:
+        raise KeyError(
+            "WT ChimeraX majority-significance coloring is only supported for "
+            "'hbond_pairs' and 'saltbridge_pairs'."
+        )
+
+    residue_replicate_df = md_variant_bundle.pair_residue_replicate_by_metric.get(
+        resolved_metric_name,
+        pd.DataFrame(),
+    ).copy()
+    if residue_replicate_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "family_id",
+                "metric_name",
+                "metric_label",
+                "resid",
+                "resname",
+                "n_variants",
+                "n_variants_tested",
+                "n_variants_significant_positive",
+                "n_variants_significant_negative",
+                "fraction_variants_significant_positive",
+                "fraction_variants_significant_negative",
+                "majority_fraction",
+                "majority_direction",
+                "mean_score_raw",
+                "mean_gain_raw",
+                "mean_loss_raw",
+                "majority_fraction_threshold",
+                "alpha_fdr",
+            ]
+        )
+
+    metric_label_map = {
+        "hbond_pairs": "Hydrogen bonds",
+        "saltbridge_pairs": "Salt bridges",
+    }
+    metadata_df = md_variant_bundle.metadata_df
+    family_rows = []
+
+    for family_id in md_variant_bundle.family_ids:
+        family_metadata_df = metadata_df.loc[metadata_df["family"].eq(family_id)].copy()
+        if family_metadata_df.empty or not family_metadata_df["is_wildtype"].any():
+            continue
+
+        wildtype_system = family_metadata_df.loc[
+            family_metadata_df["is_wildtype"],
+            "system",
+        ].iat[0]
+        variant_systems = compute_md_variant_order(metadata_df, family_id)
+        if not variant_systems:
+            continue
+
+        family_systems = [wildtype_system, *variant_systems]
+        family_residue_df = residue_replicate_df.loc[
+            residue_replicate_df["system"].isin(family_systems)
+        ].copy()
+        if family_residue_df.empty:
+            continue
+
+        residue_name_lookup = (
+            family_residue_df.loc[:, ["resid", "resname"]]
+            .dropna(subset=["resid"])
+            .assign(resid=lambda df: pd.to_numeric(df["resid"], errors="coerce").astype("Int64"))
+            .dropna(subset=["resid"])
+            .assign(resid=lambda df: df["resid"].astype(int))
+            .drop_duplicates(subset=["resid"])
+            .sort_values(["resid"])
+        )
+        residue_numbers = residue_name_lookup["resid"].astype(int).tolist()
+        if not residue_numbers:
+            continue
+        residue_name_map = dict(
+            zip(
+                residue_name_lookup["resid"].astype(int),
+                residue_name_lookup["resname"].astype(str),
+            )
+        )
+
+        wildtype_replicate_count = int(md_variant_bundle.replicate_count_by_system.get(wildtype_system, 0))
+        if wildtype_replicate_count < 2:
+            continue
+        wildtype_replicate_indices = list(range(1, wildtype_replicate_count + 1))
+        wildtype_matrix_df = _build_md_variant_residue_replicate_matrix(
+            residue_replicate_df=family_residue_df,
+            system_name=wildtype_system,
+            residue_numbers=residue_numbers,
+            replicate_indices=wildtype_replicate_indices,
+        )
+
+        variant_test_tables = []
+        for variant_system in variant_systems:
+            variant_replicate_count = int(
+                md_variant_bundle.replicate_count_by_system.get(variant_system, 0)
+            )
+            if variant_replicate_count < 2:
+                continue
+
+            variant_replicate_indices = list(range(1, variant_replicate_count + 1))
+            variant_matrix_df = _build_md_variant_residue_replicate_matrix(
+                residue_replicate_df=family_residue_df,
+                system_name=variant_system,
+                residue_numbers=residue_numbers,
+                replicate_indices=variant_replicate_indices,
+            )
+            variant_label = get_md_variant_display_label(
+                metadata_df,
+                variant_system,
+            )
+
+            test_rows = []
+            for resid in residue_numbers:
+                variant_values = variant_matrix_df.loc[resid].to_numpy(dtype=float)
+                wildtype_values = wildtype_matrix_df.loc[resid].to_numpy(dtype=float)
+                statistic, p_value = _compute_welch_ttest(
+                    variant_values,
+                    wildtype_values,
+                )
+                variant_mean = (
+                    float(np.mean(variant_values))
+                    if variant_values.size
+                    else np.nan
+                )
+                wildtype_mean = (
+                    float(np.mean(wildtype_values))
+                    if wildtype_values.size
+                    else np.nan
+                )
+                mean_difference = (
+                    variant_mean - wildtype_mean
+                    if np.isfinite(variant_mean) and np.isfinite(wildtype_mean)
+                    else np.nan
+                )
+                test_rows.append(
+                    {
+                        "family_id": family_id,
+                        "metric_name": resolved_metric_name,
+                        "metric_label": metric_label_map[resolved_metric_name],
+                        "variant_system": variant_system,
+                        "variant_label": variant_label,
+                        "wildtype_system": wildtype_system,
+                        "resid": int(resid),
+                        "resname": residue_name_map.get(int(resid), ""),
+                        "n_variant_samples": int(variant_values.size),
+                        "n_wildtype_samples": int(wildtype_values.size),
+                        "variant_mean": variant_mean,
+                        "wildtype_mean": wildtype_mean,
+                        "mean_difference": mean_difference,
+                        "test_statistic": statistic,
+                        "p_value": p_value,
+                    }
+                )
+
+            variant_test_df = pd.DataFrame(test_rows)
+            if variant_test_df.empty:
+                continue
+
+            variant_test_df["p_value_fdr"] = np.nan
+            variant_test_df["significant_fdr"] = False
+            valid_mask = variant_test_df["p_value"].notna()
+            if valid_mask.any():
+                reject, p_value_fdr, _, _ = multipletests(
+                    variant_test_df.loc[valid_mask, "p_value"].to_numpy(dtype=float),
+                    alpha=float(alpha),
+                    method="fdr_bh",
+                )
+                variant_test_df.loc[valid_mask, "p_value_fdr"] = p_value_fdr
+                variant_test_df.loc[valid_mask, "significant_fdr"] = reject
+
+            variant_test_df["direction_vs_wt"] = np.where(
+                variant_test_df["mean_difference"] > 0.0,
+                "positive",
+                np.where(
+                    variant_test_df["mean_difference"] < 0.0,
+                    "negative",
+                    "same",
+                ),
+            )
+            variant_test_tables.append(variant_test_df)
+
+        if not variant_test_tables:
+            continue
+
+        family_test_df = pd.concat(variant_test_tables, ignore_index=True)
+        family_test_df["significant_positive"] = (
+            family_test_df["significant_fdr"]
+            & family_test_df["direction_vs_wt"].eq("positive")
+        )
+        family_test_df["significant_negative"] = (
+            family_test_df["significant_fdr"]
+            & family_test_df["direction_vs_wt"].eq("negative")
+        )
+
+        family_summary_df = (
+            family_test_df.groupby(
+                ["family_id", "metric_name", "metric_label", "resid", "resname"],
+                as_index=False,
+            )
+            .agg(
+                n_variants=("variant_system", "nunique"),
+                n_variants_tested=("p_value", lambda values: int(np.isfinite(values).sum())),
+                n_variants_significant_positive=("significant_positive", "sum"),
+                n_variants_significant_negative=("significant_negative", "sum"),
+                mean_score_raw=("mean_difference", "mean"),
+                mean_gain_raw=(
+                    "mean_difference",
+                    lambda values: float(
+                        np.mean(
+                            np.asarray(values, dtype=float)[
+                                np.asarray(values, dtype=float) > 0.0
+                            ]
+                        )
+                    )
+                    if np.any(np.asarray(values, dtype=float) > 0.0)
+                    else 0.0,
+                ),
+                mean_loss_raw=(
+                    "mean_difference",
+                    lambda values: float(
+                        np.mean(
+                            np.asarray(values, dtype=float)[
+                                np.asarray(values, dtype=float) < 0.0
+                            ]
+                        )
+                    )
+                    if np.any(np.asarray(values, dtype=float) < 0.0)
+                    else 0.0,
+                ),
+            )
+            .sort_values(["family_id", "resid"])
+            .reset_index(drop=True)
+        )
+        family_summary_df["fraction_variants_significant_positive"] = np.where(
+            family_summary_df["n_variants_tested"] > 0,
+            family_summary_df["n_variants_significant_positive"]
+            / family_summary_df["n_variants_tested"],
+            0.0,
+        )
+        family_summary_df["fraction_variants_significant_negative"] = np.where(
+            family_summary_df["n_variants_tested"] > 0,
+            family_summary_df["n_variants_significant_negative"]
+            / family_summary_df["n_variants_tested"],
+            0.0,
+        )
+        family_summary_df["majority_fraction"] = family_summary_df[
+            [
+                "fraction_variants_significant_positive",
+                "fraction_variants_significant_negative",
+            ]
+        ].max(axis=1)
+        family_summary_df["majority_direction"] = np.where(
+            (
+                family_summary_df["fraction_variants_significant_positive"]
+                > family_summary_df["fraction_variants_significant_negative"]
+            )
+            & (
+                family_summary_df["fraction_variants_significant_positive"]
+                > float(majority_fraction_threshold)
+            ),
+            "positive",
+            np.where(
+                (
+                    family_summary_df["fraction_variants_significant_negative"]
+                    > family_summary_df["fraction_variants_significant_positive"]
+                )
+                & (
+                    family_summary_df["fraction_variants_significant_negative"]
+                    > float(majority_fraction_threshold)
+                ),
+                "negative",
+                "neutral",
+            ),
+        )
+        family_summary_df["majority_fraction_threshold"] = float(majority_fraction_threshold)
+        family_summary_df["alpha_fdr"] = float(alpha)
+        family_rows.append(family_summary_df)
+
+    if not family_rows:
+        return pd.DataFrame()
+    return pd.concat(family_rows, ignore_index=True).sort_values(
+        ["family_id", "resid"]
+    ).reset_index(drop=True)
+
+
+def _build_md_variant_pair_replicate_matrix(
+    pair_replicate_df: pd.DataFrame,
+    system_name: str,
+    pair_keys: Iterable[str],
+    replicate_indices: Iterable[int],
+) -> pd.DataFrame:
+    pair_index = pd.Index([str(pair_key) for pair_key in pair_keys], name="pair_key")
+    replicate_columns = [int(replicate_index) for replicate_index in replicate_indices]
+    if not len(pair_index) or not len(replicate_columns):
+        return pd.DataFrame(index=pair_index, columns=replicate_columns, dtype=float).fillna(0.0)
+
+    system_df = pair_replicate_df.loc[
+        pair_replicate_df["system"].eq(system_name)
+    ].copy()
+    if system_df.empty:
+        return pd.DataFrame(
+            0.0,
+            index=pair_index,
+            columns=replicate_columns,
+        )
+
+    system_df["replicate_index"] = pd.to_numeric(
+        system_df["replicate_index"],
+        errors="coerce",
+    ).astype("Int64")
+    system_df = system_df.dropna(subset=["replicate_index"]).copy()
+    system_df["replicate_index"] = system_df["replicate_index"].astype(int)
+
+    matrix_df = system_df.pivot_table(
+        index="pair_key",
+        columns="replicate_index",
+        values="occupancy_mean",
+        aggfunc="mean",
+        fill_value=0.0,
+    )
+    matrix_df = matrix_df.reindex(index=pair_index, columns=replicate_columns, fill_value=0.0)
+    return matrix_df.astype(float)
+
+
+def _build_wildtype_chimerax_pair_gain_focus_score_table(
+    md_variant_bundle: MDVariantAnalysisBundle,
+    metric_name: str,
+    alpha: float = 0.05,
+) -> pd.DataFrame:
+    resolved_metric_name = _resolve_wildtype_chimerax_metric_name(metric_name)
+    if resolved_metric_name not in {"hbond_pairs", "saltbridge_pairs"}:
+        raise KeyError(
+            "WT ChimeraX interaction focus is only supported for "
+            "'hbond_pairs' and 'saltbridge_pairs'."
+        )
+
+    pair_replicate_df = md_variant_bundle.pair_replicate_by_metric.get(
+        resolved_metric_name,
+        pd.DataFrame(),
+    ).copy()
+    if pair_replicate_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "family_id",
+                "metric_name",
+                "metric_label",
+                "pair_key",
+                "pair_label",
+                "resid_a",
+                "resname_a",
+                "resid_b",
+                "resname_b",
+                "n_variants",
+                "n_variants_tested",
+                "n_variants_positive",
+                "n_variants_significant_positive",
+                "n_variants_significant_negative",
+                "fraction_variants_positive",
+                "fraction_variants_significant_positive",
+                "fraction_variants_significant_negative",
+                "dominant_fraction",
+                "dominant_direction",
+                "mean_variant_mean",
+                "mean_wildtype_mean",
+                "mean_score_raw",
+                "mean_gain_raw",
+                "mean_loss_raw",
+                "alpha_fdr",
+                "positive_variant_labels",
+                "significant_positive_variant_labels",
+            ]
+        )
+
+    metric_label_map = {
+        "hbond_pairs": "Hydrogen bonds",
+        "saltbridge_pairs": "Salt bridges",
+    }
+    metadata_df = md_variant_bundle.metadata_df
+    family_rows = []
+
+    for family_id in md_variant_bundle.family_ids:
+        family_metadata_df = metadata_df.loc[metadata_df["family"].eq(family_id)].copy()
+        if family_metadata_df.empty or not family_metadata_df["is_wildtype"].any():
+            continue
+
+        wildtype_system = family_metadata_df.loc[
+            family_metadata_df["is_wildtype"],
+            "system",
+        ].iat[0]
+        variant_systems = compute_md_variant_order(metadata_df, family_id)
+        if not variant_systems:
+            continue
+
+        family_systems = [wildtype_system, *variant_systems]
+        family_pair_df = pair_replicate_df.loc[
+            pair_replicate_df["system"].isin(family_systems)
+        ].copy()
+        if family_pair_df.empty:
+            continue
+
+        pair_lookup_df = (
+            family_pair_df[
+                [
+                    "pair_key",
+                    "pair_label",
+                    "resid_a",
+                    "resname_a",
+                    "resid_b",
+                    "resname_b",
+                ]
+            ]
+            .drop_duplicates(subset=["pair_key"])
+            .sort_values(["resid_a", "resid_b", "pair_label"])
+            .reset_index(drop=True)
+        )
+        pair_keys = pair_lookup_df["pair_key"].astype(str).tolist()
+        if not pair_keys:
+            continue
+
+        wildtype_replicate_count = int(md_variant_bundle.replicate_count_by_system.get(wildtype_system, 0))
+        if wildtype_replicate_count < 2:
+            continue
+        wildtype_matrix_df = _build_md_variant_pair_replicate_matrix(
+            pair_replicate_df=family_pair_df,
+            system_name=wildtype_system,
+            pair_keys=pair_keys,
+            replicate_indices=range(1, wildtype_replicate_count + 1),
+        )
+
+        variant_test_tables = []
+        for variant_system in variant_systems:
+            variant_replicate_count = int(
+                md_variant_bundle.replicate_count_by_system.get(variant_system, 0)
+            )
+            if variant_replicate_count < 2:
+                continue
+
+            variant_matrix_df = _build_md_variant_pair_replicate_matrix(
+                pair_replicate_df=family_pair_df,
+                system_name=variant_system,
+                pair_keys=pair_keys,
+                replicate_indices=range(1, variant_replicate_count + 1),
+            )
+            variant_label = get_md_variant_display_label(
+                metadata_df,
+                variant_system,
+            )
+
+            test_rows = []
+            for pair_row in pair_lookup_df.itertuples(index=False):
+                pair_key = str(pair_row.pair_key)
+                variant_values = variant_matrix_df.loc[pair_key].to_numpy(dtype=float)
+                wildtype_values = wildtype_matrix_df.loc[pair_key].to_numpy(dtype=float)
+                statistic, p_value = _compute_welch_ttest(
+                    variant_values,
+                    wildtype_values,
+                )
+                variant_mean = (
+                    float(np.mean(variant_values))
+                    if variant_values.size
+                    else np.nan
+                )
+                wildtype_mean = (
+                    float(np.mean(wildtype_values))
+                    if wildtype_values.size
+                    else np.nan
+                )
+                mean_difference = (
+                    variant_mean - wildtype_mean
+                    if np.isfinite(variant_mean) and np.isfinite(wildtype_mean)
+                    else np.nan
+                )
+                test_rows.append(
+                    {
+                        "family_id": family_id,
+                        "metric_name": resolved_metric_name,
+                        "metric_label": metric_label_map[resolved_metric_name],
+                        "variant_system": variant_system,
+                        "variant_label": variant_label,
+                        "wildtype_system": wildtype_system,
+                        "pair_key": pair_key,
+                        "pair_label": str(pair_row.pair_label),
+                        "resid_a": int(pair_row.resid_a),
+                        "resname_a": str(pair_row.resname_a),
+                        "resid_b": int(pair_row.resid_b),
+                        "resname_b": str(pair_row.resname_b),
+                        "n_variant_samples": int(variant_values.size),
+                        "n_wildtype_samples": int(wildtype_values.size),
+                        "variant_mean": variant_mean,
+                        "wildtype_mean": wildtype_mean,
+                        "mean_difference": mean_difference,
+                        "test_statistic": statistic,
+                        "p_value": p_value,
+                    }
+                )
+
+            variant_test_df = pd.DataFrame(test_rows)
+            if variant_test_df.empty:
+                continue
+
+            variant_test_df["p_value_fdr"] = np.nan
+            variant_test_df["significant_fdr"] = False
+            valid_mask = variant_test_df["p_value"].notna()
+            if valid_mask.any():
+                reject, p_value_fdr, _, _ = multipletests(
+                    variant_test_df.loc[valid_mask, "p_value"].to_numpy(dtype=float),
+                    alpha=float(alpha),
+                    method="fdr_bh",
+                )
+                variant_test_df.loc[valid_mask, "p_value_fdr"] = p_value_fdr
+                variant_test_df.loc[valid_mask, "significant_fdr"] = reject
+
+            variant_test_df["direction_vs_wt"] = np.where(
+                variant_test_df["mean_difference"] > 0.0,
+                "positive",
+                np.where(
+                    variant_test_df["mean_difference"] < 0.0,
+                    "negative",
+                    "same",
+                ),
+            )
+            variant_test_tables.append(variant_test_df)
+
+        if not variant_test_tables:
+            continue
+
+        family_test_df = pd.concat(variant_test_tables, ignore_index=True)
+        family_test_df["positive"] = family_test_df["direction_vs_wt"].eq("positive")
+        family_test_df["significant_positive"] = (
+            family_test_df["significant_fdr"]
+            & family_test_df["direction_vs_wt"].eq("positive")
+        )
+        family_test_df["significant_negative"] = (
+            family_test_df["significant_fdr"]
+            & family_test_df["direction_vs_wt"].eq("negative")
+        )
+
+        family_summary_df = (
+            family_test_df.groupby(
+                [
+                    "family_id",
+                    "metric_name",
+                    "metric_label",
+                    "pair_key",
+                    "pair_label",
+                    "resid_a",
+                    "resname_a",
+                    "resid_b",
+                    "resname_b",
+                ],
+                as_index=False,
+            )
+            .agg(
+                n_variants=("variant_system", "nunique"),
+                n_variants_tested=("p_value", lambda values: int(np.isfinite(values).sum())),
+                n_variants_positive=("positive", "sum"),
+                n_variants_significant_positive=("significant_positive", "sum"),
+                n_variants_significant_negative=("significant_negative", "sum"),
+                mean_variant_mean=("variant_mean", "mean"),
+                mean_wildtype_mean=("wildtype_mean", "mean"),
+                mean_score_raw=("mean_difference", "mean"),
+                mean_gain_raw=(
+                    "mean_difference",
+                    lambda values: float(
+                        np.mean(
+                            np.asarray(values, dtype=float)[
+                                np.asarray(values, dtype=float) > 0.0
+                            ]
+                        )
+                    )
+                    if np.any(np.asarray(values, dtype=float) > 0.0)
+                    else 0.0,
+                ),
+                mean_loss_raw=(
+                    "mean_difference",
+                    lambda values: float(
+                        np.mean(
+                            np.asarray(values, dtype=float)[
+                                np.asarray(values, dtype=float) < 0.0
+                            ]
+                        )
+                    )
+                    if np.any(np.asarray(values, dtype=float) < 0.0)
+                    else 0.0,
+                ),
+            )
+            .sort_values(["family_id", "resid_a", "resid_b", "pair_label"])
+            .reset_index(drop=True)
+        )
+        family_summary_df["fraction_variants_positive"] = np.where(
+            family_summary_df["n_variants_tested"] > 0,
+            family_summary_df["n_variants_positive"]
+            / family_summary_df["n_variants_tested"],
+            0.0,
+        )
+        family_summary_df["fraction_variants_significant_positive"] = np.where(
+            family_summary_df["n_variants_tested"] > 0,
+            family_summary_df["n_variants_significant_positive"]
+            / family_summary_df["n_variants_tested"],
+            0.0,
+        )
+        family_summary_df["fraction_variants_significant_negative"] = np.where(
+            family_summary_df["n_variants_tested"] > 0,
+            family_summary_df["n_variants_significant_negative"]
+            / family_summary_df["n_variants_tested"],
+            0.0,
+        )
+        family_summary_df["dominant_fraction"] = family_summary_df[
+            [
+                "fraction_variants_significant_positive",
+                "fraction_variants_significant_negative",
+            ]
+        ].max(axis=1)
+        family_summary_df["dominant_direction"] = np.where(
+            family_summary_df["fraction_variants_significant_positive"]
+            > family_summary_df["fraction_variants_significant_negative"],
+            "positive",
+            np.where(
+                family_summary_df["fraction_variants_significant_negative"]
+                > family_summary_df["fraction_variants_significant_positive"],
+                "negative",
+                "neutral",
+            ),
+        )
+        family_summary_df["alpha_fdr"] = float(alpha)
+
+        positive_label_map = (
+            family_test_df.loc[family_test_df["positive"]]
+            .groupby("pair_key")["variant_label"]
+            .agg(lambda values: "; ".join(sorted(dict.fromkeys(str(value) for value in values))))
+            .to_dict()
+        )
+        significant_positive_label_map = (
+            family_test_df.loc[family_test_df["significant_positive"]]
+            .groupby("pair_key")["variant_label"]
+            .agg(lambda values: "; ".join(sorted(dict.fromkeys(str(value) for value in values))))
+            .to_dict()
+        )
+        family_summary_df["positive_variant_labels"] = family_summary_df["pair_key"].map(
+            positive_label_map
+        ).fillna("")
+        family_summary_df["significant_positive_variant_labels"] = family_summary_df[
+            "pair_key"
+        ].map(significant_positive_label_map).fillna("")
+        family_rows.append(family_summary_df)
+
+    if not family_rows:
+        return pd.DataFrame()
+    return pd.concat(family_rows, ignore_index=True).sort_values(
+        [
+            "family_id",
+            "fraction_variants_significant_positive",
+            "n_variants_significant_positive",
+            "mean_gain_raw",
+            "pair_label",
+        ],
+        ascending=[True, False, False, False, True],
+    ).reset_index(drop=True)
+
+
+def _build_wildtype_chimerax_interaction_change_score_table(
+    md_variant_bundle: MDVariantAnalysisBundle,
+    interaction_change_z_threshold: float = 1.0,
+    interaction_change_z_breaks: Iterable[float] | None = None,
+    interaction_colors: dict[str, Iterable[str]] | None = None,
+    neutral_color: str = "#d9d9d9",
+) -> pd.DataFrame:
+    resolved_z_breaks = _normalize_signed_z_breaks(
+        (interaction_change_z_threshold,)
+        if interaction_change_z_breaks is None
+        else interaction_change_z_breaks
+    )
+    resolved_interaction_colors = _normalize_chimerax_interaction_colors(
+        interaction_colors=interaction_colors,
+        n_intervals=len(resolved_z_breaks),
+    )
+    metric_tables = {
+        metric_name: _build_wildtype_chimerax_family_average_score_table(
+            md_variant_bundle=md_variant_bundle,
+            wildtype_alignment_df=None,
+            metric_name=metric_name,
+        )
+        for metric_name in ("hbond_pairs", "saltbridge_pairs")
+    }
+
+    merged_df = None
+    for metric_name, metric_table_df in metric_tables.items():
+        rename_prefix = metric_name.replace("_pairs", "")
+        metric_subset_df = metric_table_df[
+            [
+                "family_id",
+                "resid",
+                "resname",
+                "n_variants",
+                "mean_gain_raw",
+                "mean_loss_raw",
+            ]
+        ].rename(
+            columns={
+                "n_variants": f"{rename_prefix}_n_variants",
+                "mean_gain_raw": f"{rename_prefix}_gain_raw",
+                "mean_loss_raw": f"{rename_prefix}_loss_raw",
+            }
+        )
+        if merged_df is None:
+            merged_df = metric_subset_df
+        else:
+            merged_df = merged_df.merge(
+                metric_subset_df,
+                on=["family_id", "resid", "resname"],
+                how="outer",
+            )
+
+    if merged_df is None or merged_df.empty:
+        return pd.DataFrame()
+
+    merged_df = merged_df.fillna(0.0).copy()
+    merged_df["n_variants"] = merged_df[
+        ["hbond_n_variants", "saltbridge_n_variants"]
+    ].max(axis=1).astype(int)
+    merged_df["hbond_loss_magnitude_raw"] = (
+        -pd.to_numeric(merged_df["hbond_loss_raw"], errors="coerce").fillna(0.0)
+    ).clip(lower=0.0)
+    merged_df["saltbridge_loss_magnitude_raw"] = (
+        -pd.to_numeric(merged_df["saltbridge_loss_raw"], errors="coerce").fillna(0.0)
+    ).clip(lower=0.0)
+    merged_df["hbond_gain_raw"] = pd.to_numeric(
+        merged_df["hbond_gain_raw"], errors="coerce"
+    ).fillna(0.0)
+    merged_df["saltbridge_gain_raw"] = pd.to_numeric(
+        merged_df["saltbridge_gain_raw"], errors="coerce"
+    ).fillna(0.0)
+
+    channel_specs = [
+        ("hbond_gain", "hbond_gain_raw", "Hydrogen-bond gain"),
+        ("hbond_loss", "hbond_loss_magnitude_raw", "Hydrogen-bond loss"),
+        ("saltbridge_gain", "saltbridge_gain_raw", "Salt-bridge gain"),
+        ("saltbridge_loss", "saltbridge_loss_magnitude_raw", "Salt-bridge loss"),
+    ]
+    channel_order = [spec[0] for spec in channel_specs]
+    channel_label_map = {channel_name: label for channel_name, _, label in channel_specs}
+
+    for channel_name, raw_column_name, _ in channel_specs:
+        merged_df[raw_column_name] = pd.to_numeric(
+            merged_df[raw_column_name],
+            errors="coerce",
+        ).fillna(0.0)
+        merged_df[f"{channel_name}_score_z"] = (
+            merged_df.groupby("family_id", group_keys=False)[raw_column_name]
+            .apply(_compute_md_variant_group_zscores)
+            .astype(float)
+        )
+
+    z_score_columns = [f"{channel_name}_score_z" for channel_name in channel_order]
+    z_score_matrix = merged_df[z_score_columns].to_numpy(dtype=float)
+    dominant_channel_indices = np.argmax(z_score_matrix, axis=1)
+    dominant_score_z = z_score_matrix[np.arange(len(merged_df)), dominant_channel_indices]
+    dominant_channel_names = np.asarray(channel_order, dtype=object)[dominant_channel_indices]
+    dominant_raw_values = np.asarray(
+        [
+            merged_df.iloc[row_index][
+                next(
+                    raw_column_name
+                    for channel_name, raw_column_name, _ in channel_specs
+                    if channel_name == dominant_channel_names[row_index]
+                )
+            ]
+            for row_index in range(len(merged_df))
+        ],
+        dtype=float,
+    )
+
+    merged_df["dominant_channel"] = dominant_channel_names
+    merged_df["dominant_label"] = [
+        channel_label_map[channel_name]
+        for channel_name in dominant_channel_names
+    ]
+    merged_df["dominant_score_z"] = dominant_score_z.astype(float)
+    merged_df["dominant_score_raw"] = dominant_raw_values
+    merged_df["passes_threshold"] = merged_df["dominant_score_z"] >= resolved_z_breaks[0]
+    scale_limit = float(resolved_z_breaks[-1])
+
+    merged_df["normalized_value"] = np.clip(
+        merged_df["dominant_score_z"].astype(float) / scale_limit,
+        0.0,
+        1.0,
+    )
+    merged_df["color_hex"] = neutral_color
+    merged_df["interaction_z_bin"] = -1
+    merged_df["interaction_z_lower"] = np.nan
+    merged_df["interaction_z_upper"] = np.nan
+    merged_df["interaction_z_bin_label"] = f"z < {resolved_z_breaks[0]:0.3g}"
+    merged_df["interaction_palette_index"] = pd.Series(pd.NA, index=merged_df.index, dtype="Int64")
+    for channel_name, _, _ in channel_specs:
+        channel_mask = merged_df["dominant_channel"].eq(channel_name) & merged_df["passes_threshold"]
+        if not channel_mask.any():
+            continue
+        for break_index, break_value in enumerate(resolved_z_breaks):
+            next_break_value = (
+                resolved_z_breaks[break_index + 1]
+                if break_index + 1 < len(resolved_z_breaks)
+                else None
+            )
+            interval_mask = channel_mask & (merged_df["dominant_score_z"] >= break_value)
+            if next_break_value is not None:
+                interval_mask &= merged_df["dominant_score_z"] < next_break_value
+                interval_label = f"{break_value:0.3g} <= z < {next_break_value:0.3g}"
+            else:
+                interval_label = f"z >= {break_value:0.3g}"
+            merged_df.loc[interval_mask, "color_hex"] = resolved_interaction_colors[
+                channel_name
+            ][break_index]
+            merged_df.loc[interval_mask, "interaction_z_bin"] = break_index
+            merged_df.loc[interval_mask, "interaction_z_lower"] = break_value
+            merged_df.loc[interval_mask, "interaction_z_upper"] = next_break_value
+            merged_df.loc[interval_mask, "interaction_z_bin_label"] = interval_label
+            merged_df.loc[interval_mask, "interaction_palette_index"] = break_index
+
+    merged_df["metric_name"] = "interaction_change"
+    merged_df["metric_label"] = "H-bond and salt-bridge change"
+    merged_df["color_mode"] = "combined"
+    merged_df["scale_limit"] = float(scale_limit)
+    merged_df["mean_score_raw"] = np.where(
+        merged_df["dominant_channel"].str.endswith("loss"),
+        -merged_df["dominant_score_raw"].astype(float),
+        merged_df["dominant_score_raw"].astype(float),
+    )
+    merged_df["mean_gain_raw"] = np.where(
+        merged_df["dominant_channel"].str.endswith("gain"),
+        merged_df["dominant_score_raw"].astype(float),
+        0.0,
+    )
+    merged_df["mean_loss_raw"] = np.where(
+        merged_df["dominant_channel"].str.endswith("loss"),
+        -merged_df["dominant_score_raw"].astype(float),
+        0.0,
+    )
+    merged_df["fraction_variants_positive"] = np.where(
+        merged_df["dominant_channel"].str.endswith("gain"),
+        1.0,
+        0.0,
+    )
+    merged_df["fraction_variants_negative"] = np.where(
+        merged_df["dominant_channel"].str.endswith("loss"),
+        1.0,
+        0.0,
+    )
+    merged_df["interaction_change_z_threshold"] = resolved_z_breaks[0]
+    merged_df["interaction_change_z_breaks"] = repr(resolved_z_breaks)
+    merged_df["component_color_hex"] = merged_df["color_hex"]
+    return merged_df.sort_values(["family_id", "resid"]).reset_index(drop=True)
+
+
+def build_wildtype_chimerax_command_bundle(
+    md_variant_bundle: MDVariantAnalysisBundle,
+    wildtype_alignment_df: pd.DataFrame,
+    metric_name: str = "rmsf",
+    color_mode: str = "signed",
+    combined_pdb_path: Path | None = None,
+    model_id: str = "#1",
+    target_layout: str = "combined_model",
+    separate_model_id_by_family: dict[str, str] | None = None,
+    separate_model_chain_id: str = "A",
+    interaction_change_z_threshold: float = 1.0,
+    interaction_change_z_breaks: Iterable[float] | None = None,
+    interaction_colors: dict[str, Iterable[str]] | None = None,
+    significance_alpha: float = 0.05,
+    majority_fraction_threshold: float = 0.5,
+    emphasize_colored_residues: bool = False,
+    emphasis_style: str = "ball",
+    signed_score_mode: str = "zscore",
+    signed_z_breaks: Iterable[float] = (1.0, 2.0, 3.0),
+    n_color_bins: int = 9,
+    neutral_color: str = "#d9d9d9",
+) -> WildtypeChimeraXCommandBundle:
+    resolved_metric_name = _resolve_wildtype_chimerax_metric_name(metric_name)
+    resolved_color_mode = str(color_mode).strip().lower()
+    resolved_signed_score_mode = str(signed_score_mode).strip().lower()
+    if resolved_color_mode not in {
+        "signed",
+        "destabilizing",
+        "stabilizing",
+        "combined",
+        "majority_significance",
+    }:
+        raise KeyError(
+            "Unsupported WT ChimeraX color mode. Expected one of "
+            "'signed', 'destabilizing', 'stabilizing', 'combined', or "
+            "'majority_significance'."
+        )
+    if resolved_signed_score_mode not in {"raw", "zscore"}:
+        raise KeyError(
+            "Unsupported WT ChimeraX signed score mode. Expected one of "
+            "'raw' or 'zscore'."
+        )
+    if resolved_metric_name == "interaction_change":
+        if resolved_color_mode != "combined":
+            raise KeyError(
+                "WT ChimeraX metric 'interaction_change' requires "
+                "color_mode='combined'."
+            )
+    elif resolved_color_mode == "combined":
+        raise KeyError(
+            "WT ChimeraX color_mode='combined' is only supported for "
+            "metric_name='interaction_change'."
+        )
+    if resolved_color_mode == "majority_significance" and resolved_metric_name not in {
+        "hbond_pairs",
+        "saltbridge_pairs",
+    }:
+        raise KeyError(
+            "WT ChimeraX color_mode='majority_significance' is only supported for "
+            "'hbond_pairs' and 'saltbridge_pairs'."
+        )
+    resolved_emphasis_style = str(emphasis_style).strip().lower()
+    if resolved_emphasis_style not in {"ball", "stick", "sphere"}:
+        raise KeyError(
+            "Unsupported WT ChimeraX emphasis style. Expected one of "
+            "'ball', 'stick', or 'sphere'."
+        )
+
+    if resolved_metric_name == "interaction_change":
+        resolved_interaction_z_breaks = _normalize_signed_z_breaks(
+            (interaction_change_z_threshold,)
+            if interaction_change_z_breaks is None
+            else interaction_change_z_breaks
+        )
+        resolved_interaction_colors = _normalize_chimerax_interaction_colors(
+            interaction_colors=interaction_colors,
+            n_intervals=len(resolved_interaction_z_breaks),
+        )
+        residue_color_df = _build_wildtype_chimerax_interaction_change_score_table(
+            md_variant_bundle=md_variant_bundle,
+            interaction_change_z_threshold=interaction_change_z_threshold,
+            interaction_change_z_breaks=interaction_change_z_breaks,
+            interaction_colors=interaction_colors,
+            neutral_color=neutral_color,
+        )
+    elif resolved_color_mode == "majority_significance":
+        residue_color_df = _build_wildtype_chimerax_pair_majority_significance_score_table(
+            md_variant_bundle=md_variant_bundle,
+            metric_name=resolved_metric_name,
+            alpha=significance_alpha,
+            majority_fraction_threshold=majority_fraction_threshold,
+        )
+    else:
+        residue_color_df = _build_wildtype_chimerax_family_average_score_table(
+            md_variant_bundle=md_variant_bundle,
+            wildtype_alignment_df=wildtype_alignment_df,
+            metric_name=resolved_metric_name,
+        )
+    target_spec_df = _resolve_wildtype_chimerax_target_spec_df(
+        wildtype_alignment_df=wildtype_alignment_df,
+        target_layout=target_layout,
+        combined_model_id=model_id,
+        separate_model_id_by_family=separate_model_id_by_family,
+        separate_model_chain_id=separate_model_chain_id,
+    )
+    if residue_color_df.empty:
+        return WildtypeChimeraXCommandBundle(
+            residue_color_df=pd.DataFrame(),
+            apply_command="",
+            open_command="",
+        )
+
+    residue_color_df = residue_color_df.copy()
+    residue_color_df = residue_color_df.merge(
+        target_spec_df[
+            [
+                "family_id",
+                "aligned_pdb_path",
+                "target_model_id",
+                "target_chain_id",
+            ]
+        ],
+        on="family_id",
+        how="left",
+        validate="many_to_one",
+    )
+    if resolved_metric_name == "interaction_change":
+        scale_limit = float(residue_color_df["scale_limit"].iloc[0]) if not residue_color_df.empty else float(
+            interaction_change_z_threshold
+        )
+    elif resolved_color_mode == "signed":
+        residue_color_df["color_hex"] = neutral_color
+        if resolved_signed_score_mode == "zscore":
+            resolved_signed_z_breaks = _normalize_signed_z_breaks(signed_z_breaks)
+            negative_bin_colors = ["#c2d3e4", "#578abf", "#2166ac"]
+            positive_bin_colors = ["#e5bec3", "#d48690", "#b2182b"]
+            if len(resolved_signed_z_breaks) != 3:
+                negative_bin_colors = [
+                    to_hex(DEFAULT_RMSF_DELTA_CMAP(value))
+                    for value in np.linspace(0.38, 0.08, len(resolved_signed_z_breaks))
+                ]
+                positive_bin_colors = [
+                    to_hex(DEFAULT_RMSF_DELTA_CMAP(value))
+                    for value in np.linspace(0.62, 0.92, len(resolved_signed_z_breaks))
+                ]
+            residue_color_df["color_value"] = pd.to_numeric(
+                residue_color_df["mean_score_z"],
+                errors="coerce",
+            ).fillna(0.0)
+            residue_color_df["color_value_label"] = "Mean WT-relative delta z-score across variants"
+            scale_limit = float(max(resolved_signed_z_breaks))
+            residue_color_df["normalized_value"] = np.clip(
+                residue_color_df["color_value"].astype(float) / scale_limit,
+                -1.0,
+                1.0,
+            )
+            residue_color_df["signed_abs_z"] = residue_color_df["color_value"].abs()
+            residue_color_df["signed_z_bin_label"] = (
+                f"|z| < {resolved_signed_z_breaks[0]:0.3g}"
+            )
+            for break_index, break_value in enumerate(resolved_signed_z_breaks):
+                next_break_value = (
+                    resolved_signed_z_breaks[break_index + 1]
+                    if break_index + 1 < len(resolved_signed_z_breaks)
+                    else None
+                )
+                if next_break_value is None:
+                    bin_label = f"|z| >= {break_value:0.3g}"
+                    bin_mask = residue_color_df["signed_abs_z"] >= float(break_value)
+                else:
+                    bin_label = f"{break_value:0.3g} <= |z| < {next_break_value:0.3g}"
+                    bin_mask = (
+                        residue_color_df["signed_abs_z"] >= float(break_value)
+                    ) & (
+                        residue_color_df["signed_abs_z"] < float(next_break_value)
+                    )
+                negative_mask = bin_mask & (residue_color_df["color_value"] < 0.0)
+                positive_mask = bin_mask & (residue_color_df["color_value"] > 0.0)
+                residue_color_df.loc[negative_mask, "color_hex"] = negative_bin_colors[
+                    min(break_index, len(negative_bin_colors) - 1)
+                ]
+                residue_color_df.loc[positive_mask, "color_hex"] = positive_bin_colors[
+                    min(break_index, len(positive_bin_colors) - 1)
+                ]
+                residue_color_df.loc[bin_mask, "signed_z_bin_label"] = bin_label
+        else:
+            residue_color_df["color_value"] = residue_color_df["mean_score_raw"].astype(float)
+            residue_color_df["color_value_label"] = "Mean WT-relative delta across variants"
+            nonzero_mask = residue_color_df["color_value"].abs() > 0.0
+            nonzero_values = residue_color_df.loc[nonzero_mask, "color_value"].abs().to_numpy(dtype=float)
+            scale_limit = float(np.nanquantile(nonzero_values, 0.95)) if len(nonzero_values) else 0.0
+            if not np.isfinite(scale_limit) or scale_limit <= 0.0:
+                scale_limit = float(nonzero_values.max()) if len(nonzero_values) else 1.0
+            scale_limit = max(scale_limit, 1e-9)
+            residue_color_df["normalized_value"] = np.clip(
+                residue_color_df["color_value"].astype(float) / scale_limit,
+                -1.0,
+                1.0,
+            )
+            neutral_threshold = 1.0 / max(float(n_color_bins), 8.0)
+            palette = [
+                to_hex(DEFAULT_RMSF_DELTA_CMAP(value))
+                for value in np.linspace(0.0, 1.0, max(int(n_color_bins), 3))
+            ]
+            colored_mask = residue_color_df["normalized_value"].abs() >= neutral_threshold
+            if colored_mask.any():
+                signed_fraction = (
+                    residue_color_df.loc[colored_mask, "normalized_value"].to_numpy(dtype=float) + 1.0
+                ) / 2.0
+                color_indices = np.floor(signed_fraction * len(palette)).astype(int)
+                color_indices = np.clip(color_indices, 0, len(palette) - 1)
+                residue_color_df.loc[colored_mask, "color_hex"] = [
+                    palette[int(index)]
+                    for index in color_indices
+                ]
+    elif resolved_color_mode == "majority_significance":
+        residue_color_df["color_value"] = pd.to_numeric(
+            residue_color_df["majority_fraction"],
+            errors="coerce",
+        ).fillna(0.0)
+        residue_color_df["color_value_label"] = (
+            "Fraction of variants with FDR-significant WT-relative occupancy change "
+            "in the dominant direction"
+        )
+        residue_color_df["normalized_value"] = np.clip(
+            residue_color_df["color_value"].astype(float),
+            0.0,
+            1.0,
+        )
+        residue_color_df["color_hex"] = neutral_color
+        residue_color_df["majority_fraction_bin_label"] = (
+            "<= "
+            + residue_color_df["majority_fraction_threshold"].astype(float).map(
+                lambda value: f"{value:0.3g}"
+            )
+        )
+        low_positive_color, mid_positive_color, high_positive_color = (
+            "#e5bec3",
+            "#d48690",
+            "#b2182b",
+        )
+        low_negative_color, mid_negative_color, high_negative_color = (
+            "#c2d3e4",
+            "#578abf",
+            "#2166ac",
+        )
+        lower_mask = (
+            residue_color_df["majority_direction"].eq("negative")
+            & (residue_color_df["majority_fraction"] > residue_color_df["majority_fraction_threshold"])
+        )
+        higher_mask = (
+            residue_color_df["majority_direction"].eq("positive")
+            & (residue_color_df["majority_fraction"] > residue_color_df["majority_fraction_threshold"])
+        )
+        threshold_values = residue_color_df["majority_fraction_threshold"].astype(float)
+        universal_mask = residue_color_df["majority_fraction"] >= 0.999999
+        strong_mask = residue_color_df["majority_fraction"] >= 0.75
+        moderate_mask = residue_color_df["majority_fraction"] > threshold_values
+        residue_color_df.loc[moderate_mask, "majority_fraction_bin_label"] = (
+            f"> {float(residue_color_df['majority_fraction_threshold'].iloc[0]):0.3g} to < 0.75"
+        )
+        residue_color_df.loc[strong_mask, "majority_fraction_bin_label"] = "0.75 to < 1.0"
+        residue_color_df.loc[universal_mask, "majority_fraction_bin_label"] = "1.0"
+        residue_color_df.loc[higher_mask & moderate_mask, "color_hex"] = low_positive_color
+        residue_color_df.loc[higher_mask & strong_mask, "color_hex"] = mid_positive_color
+        residue_color_df.loc[higher_mask & universal_mask, "color_hex"] = high_positive_color
+        residue_color_df.loc[lower_mask & moderate_mask, "color_hex"] = low_negative_color
+        residue_color_df.loc[lower_mask & strong_mask, "color_hex"] = mid_negative_color
+        residue_color_df.loc[lower_mask & universal_mask, "color_hex"] = high_negative_color
+        scale_limit = 1.0
+    else:
+        if resolved_metric_name == "rmsf":
+            if resolved_color_mode == "destabilizing":
+                focus_values = residue_color_df["mean_score_raw"].clip(lower=0.0)
+                focus_label = "Mean RMSF increase across variants"
+            else:
+                focus_values = (-residue_color_df["mean_score_raw"]).clip(lower=0.0)
+                focus_label = "Mean RMSF decrease across variants"
+        else:
+            if resolved_color_mode == "destabilizing":
+                focus_values = (-residue_color_df["mean_score_raw"]).clip(lower=0.0)
+                focus_label = "Mean interaction loss across variants"
+            else:
+                focus_values = residue_color_df["mean_score_raw"].clip(lower=0.0)
+                focus_label = "Mean interaction gain across variants"
+
+        residue_color_df["color_value"] = focus_values.astype(float)
+        residue_color_df["color_value_label"] = focus_label
+        positive_values = residue_color_df.loc[
+            residue_color_df["color_value"] > 0.0,
+            "color_value",
+        ].to_numpy(dtype=float)
+        scale_limit = float(np.nanquantile(positive_values, 0.95)) if len(positive_values) else 0.0
+        if not np.isfinite(scale_limit) or scale_limit <= 0.0:
+            scale_limit = float(positive_values.max()) if len(positive_values) else 1.0
+        scale_limit = max(scale_limit, 1e-9)
+        residue_color_df["normalized_value"] = np.clip(
+            residue_color_df["color_value"].astype(float) / scale_limit,
+            0.0,
+            1.0,
+        )
+        palette = [
+            to_hex(color)
+            for color in plt.get_cmap("Reds")(np.linspace(0.35, 0.95, max(int(n_color_bins), 3)))
+        ]
+        residue_color_df["color_hex"] = neutral_color
+        colored_mask = residue_color_df["normalized_value"] > 0.0
+        if colored_mask.any():
+            positive_fraction = residue_color_df.loc[colored_mask, "normalized_value"].to_numpy(dtype=float)
+            color_indices = np.ceil(positive_fraction * (len(palette) - 1)).astype(int)
+            color_indices = np.clip(color_indices, 0, len(palette) - 1)
+            residue_color_df.loc[colored_mask, "color_hex"] = [
+                palette[int(index)]
+                for index in color_indices
+            ]
+
+    residue_color_df["residue_spec"] = residue_color_df.apply(
+        lambda row: f"{row['target_model_id']}/{row['target_chain_id']}:{int(row['resid'])}",
+        axis=1,
+    )
+    residue_color_df["metric_name"] = resolved_metric_name
+    residue_color_df["color_mode"] = resolved_color_mode
+    residue_color_df["scale_limit"] = float(scale_limit)
+
+    metric_label = str(residue_color_df["metric_label"].iloc[0])
+    target_comment = " | ".join(
+        (
+            f"{row.family_id}={row.target_model_id}/chain {row.target_chain_id}"
+            if str(target_layout).strip().lower() == "separate_models"
+            else f"{row.family_id}={row.target_model_id}/chain {row.chain_id}"
+        )
+        for row in target_spec_df.itertuples(index=False)
+    )
+
+    color_command_lines = [
+        f"# Figure 4 WT ChimeraX coloring | metric: {metric_label} | mode: {resolved_color_mode}",
+        f"# Target layout: {str(target_layout).strip().lower()}",
+        f"# Target mapping: {target_comment}",
+        f"# Neutral color: {neutral_color}",
+        f"# Scale cap: {float(scale_limit):0.6g}",
+    ]
+    if bool(emphasize_colored_residues):
+        color_command_lines.append(
+            f"# Emphasis overlay: colored residues will also be shown as atoms in {resolved_emphasis_style} style"
+        )
+    if resolved_metric_name == "interaction_change":
+        color_command_lines.append(
+            "# Combined interaction z-score intervals: neutral below "
+            f"{resolved_interaction_z_breaks[0]:0.3g}"
+        )
+        interaction_label_map = {
+            "saltbridge_gain": "Salt-bridge gain",
+            "saltbridge_loss": "Salt-bridge loss",
+            "hbond_gain": "H-bond gain",
+            "hbond_loss": "H-bond loss",
+        }
+        for channel_name, channel_label in interaction_label_map.items():
+            for break_index, break_value in enumerate(resolved_interaction_z_breaks):
+                next_break_value = (
+                    resolved_interaction_z_breaks[break_index + 1]
+                    if break_index + 1 < len(resolved_interaction_z_breaks)
+                    else None
+                )
+                range_label = (
+                    f"{break_value:0.3g} <= z < {next_break_value:0.3g}"
+                    if next_break_value is not None
+                    else f"z >= {break_value:0.3g}"
+                )
+                color_command_lines.append(
+                    f"#   {channel_label} | {range_label}: "
+                    f"{resolved_interaction_colors[channel_name][break_index]}"
+                )
+    elif resolved_color_mode == "majority_significance":
+        majority_fraction_threshold = float(
+            residue_color_df["majority_fraction_threshold"].iloc[0]
+        )
+        alpha_value = float(residue_color_df["alpha_fdr"].iloc[0])
+        color_command_lines.extend(
+            [
+                (
+                    "# Majority-significance mode: each residue is colored only when "
+                    f"> {majority_fraction_threshold:0.3g} of variants in the family "
+                    "show an FDR-significant occupancy change vs WT in the same direction."
+                ),
+                f"# Variant-level test: Welch t-test on replicate occupancies | FDR alpha={alpha_value:0.3g}",
+                "#   negative > threshold to < 0.75: #c2d3e4 | positive > threshold to < 0.75: #e5bec3",
+                "#   negative 0.75 to < 1.0: #578abf | positive 0.75 to < 1.0: #d48690",
+                "#   negative 1.0: #2166ac | positive 1.0: #b2182b",
+            ]
+        )
+    elif resolved_color_mode == "signed" and resolved_signed_score_mode == "zscore":
+        resolved_signed_z_breaks = _normalize_signed_z_breaks(signed_z_breaks)
+        negative_bin_colors = ["#c2d3e4", "#578abf", "#2166ac"]
+        positive_bin_colors = ["#e5bec3", "#d48690", "#b2182b"]
+        if len(resolved_signed_z_breaks) != 3:
+            negative_bin_colors = [
+                to_hex(DEFAULT_RMSF_DELTA_CMAP(value))
+                for value in np.linspace(0.38, 0.08, len(resolved_signed_z_breaks))
+            ]
+            positive_bin_colors = [
+                to_hex(DEFAULT_RMSF_DELTA_CMAP(value))
+                for value in np.linspace(0.62, 0.92, len(resolved_signed_z_breaks))
+            ]
+        color_command_lines.append(
+            f"# Signed score mode: zscore | explicit |z| bins with neutral below {resolved_signed_z_breaks[0]:0.3g}"
+        )
+        for break_index, break_value in enumerate(resolved_signed_z_breaks):
+            next_break_value = (
+                resolved_signed_z_breaks[break_index + 1]
+                if break_index + 1 < len(resolved_signed_z_breaks)
+                else None
+            )
+            if next_break_value is None:
+                range_label = f"|z| >= {break_value:0.3g}"
+            else:
+                range_label = f"{break_value:0.3g} <= |z| < {next_break_value:0.3g}"
+            color_command_lines.append(
+                f"#   negative {range_label}: {negative_bin_colors[min(break_index, len(negative_bin_colors) - 1)]} | "
+                f"positive {range_label}: {positive_bin_colors[min(break_index, len(positive_bin_colors) - 1)]}"
+            )
+    if str(target_layout).strip().lower() == "combined_model":
+        color_command_lines.append(f"color {_normalize_chimerax_model_id(model_id)} {neutral_color}")
+    else:
+        for row in target_spec_df.itertuples(index=False):
+            color_command_lines.append(f"color {row.target_model_id} {neutral_color}")
+
+    colored_residue_df = residue_color_df.loc[
+        residue_color_df["color_hex"].ne(neutral_color)
+    ].copy()
+    if colored_residue_df.empty:
+        color_command_lines.append(
+            "# No residues exceeded the current coloring threshold; the model remains neutral."
+        )
+    else:
+        grouped_color_df = (
+            colored_residue_df.groupby(
+                ["family_id", "target_model_id", "target_chain_id", "color_hex"],
+                as_index=False,
+            )
+            .agg(
+                residue_numbers=("resid", lambda values: sorted(set(int(value) for value in values))),
+                max_normalized_value=("normalized_value", "max"),
+            )
+            .sort_values(["family_id", "target_model_id", "max_normalized_value"])
+        )
+        if bool(emphasize_colored_residues):
+            emphasis_group_df = (
+                colored_residue_df.groupby(
+                    ["family_id", "target_model_id", "target_chain_id"],
+                    as_index=False,
+                )
+                .agg(
+                    residue_numbers=("resid", lambda values: sorted(set(int(value) for value in values))),
+                )
+                .sort_values(["family_id", "target_model_id"])
+            )
+            for row in emphasis_group_df.itertuples(index=False):
+                residue_range_spec = _compress_residue_numbers_to_ranges(row.residue_numbers)
+                if not residue_range_spec:
+                    continue
+                residue_spec = f"{row.target_model_id}/{row.target_chain_id}:{residue_range_spec}"
+                color_command_lines.append(f"show {residue_spec} atoms")
+                color_command_lines.append(f"style {residue_spec} {resolved_emphasis_style}")
+        for row in grouped_color_df.itertuples(index=False):
+            residue_range_spec = _compress_residue_numbers_to_ranges(row.residue_numbers)
+            if not residue_range_spec:
+                continue
+            color_command_lines.append(
+                f"color {row.target_model_id}/{row.target_chain_id}:{residue_range_spec} {row.color_hex}"
+            )
+
+    apply_command = "\n".join(color_command_lines)
+    open_command_lines = list(color_command_lines)
+    insert_index = 5
+    if str(target_layout).strip().lower() == "combined_model":
+        if combined_pdb_path is not None:
+            open_command_lines.insert(
+                insert_index,
+                f"open {json.dumps(str(Path(combined_pdb_path).resolve()))}",
+            )
+    else:
+        for row in reversed(list(target_spec_df.itertuples(index=False))):
+            open_command_lines.insert(
+                insert_index,
+                f"open {json.dumps(str(Path(row.aligned_pdb_path).resolve()))}",
+            )
+    open_command = "\n".join(open_command_lines)
+
+    return WildtypeChimeraXCommandBundle(
+        residue_color_df=residue_color_df.sort_values(["family_id", "resid"]).reset_index(drop=True),
+        apply_command=apply_command,
+        open_command=open_command,
+    )
+
+
+def build_wildtype_chimerax_interaction_gain_focus_table(
+    md_variant_bundle: MDVariantAnalysisBundle,
+    wildtype_alignment_df: pd.DataFrame,
+    metric_name: str,
+    combined_pdb_path: Path | None = None,
+    model_id: str = "#1",
+    target_layout: str = "combined_model",
+    separate_model_id_by_family: dict[str, str] | None = None,
+    separate_model_chain_id: str = "A",
+    significance_alpha: float = 0.05,
+    minimum_significant_fraction: float | None = 0.5,
+    minimum_significant_variant_count: int | None = 2,
+    selection_rule: str = "fraction_or_count",
+    max_pairs_per_family: int = 3,
+    emphasis_style: str = "stick",
+    neutral_color: str = "#c1c1c1",
+) -> pd.DataFrame:
+    resolved_metric_name = _resolve_wildtype_chimerax_metric_name(metric_name)
+    if resolved_metric_name not in {"hbond_pairs", "saltbridge_pairs"}:
+        raise KeyError(
+            "WT ChimeraX interaction focus is only supported for "
+            "'hbond_pairs' and 'saltbridge_pairs'."
+        )
+    if minimum_significant_fraction is None and minimum_significant_variant_count is None:
+        raise ValueError(
+            "At least one interaction-focus selection threshold must be provided."
+        )
+
+    resolved_selection_rule = str(selection_rule).strip().lower()
+    if resolved_selection_rule not in {
+        "fraction_or_count",
+        "fraction_and_count",
+        "fraction_only",
+        "count_only",
+    }:
+        raise ValueError(
+            "Unsupported interaction-focus selection rule. Expected one of "
+            "'fraction_or_count', 'fraction_and_count', 'fraction_only', or "
+            "'count_only'."
+        )
+
+    resolved_emphasis_style = str(emphasis_style).strip().lower()
+    if resolved_emphasis_style not in {"ball", "stick", "sphere"}:
+        raise ValueError(
+            "Unsupported WT ChimeraX interaction-focus emphasis style. Expected one of "
+            "'ball', 'stick', or 'sphere'."
+        )
+    if int(max_pairs_per_family) <= 0:
+        raise ValueError("max_pairs_per_family must be positive.")
+
+    focus_df = _build_wildtype_chimerax_pair_gain_focus_score_table(
+        md_variant_bundle=md_variant_bundle,
+        metric_name=resolved_metric_name,
+        alpha=significance_alpha,
+    )
+    if focus_df.empty:
+        return focus_df
+
+    target_spec_df = _resolve_wildtype_chimerax_target_spec_df(
+        wildtype_alignment_df=wildtype_alignment_df,
+        target_layout=target_layout,
+        combined_model_id=model_id,
+        separate_model_id_by_family=separate_model_id_by_family,
+        separate_model_chain_id=separate_model_chain_id,
+    )
+    focus_df = focus_df.merge(
+        target_spec_df[
+            [
+                "family_id",
+                "aligned_pdb_path",
+                "target_model_id",
+                "target_chain_id",
+            ]
+        ],
+        on="family_id",
+        how="left",
+        validate="many_to_one",
+    )
+    focus_df = focus_df.loc[focus_df["dominant_direction"].eq("positive")].copy()
+    if focus_df.empty:
+        return focus_df
+
+    fraction_threshold = (
+        float(minimum_significant_fraction)
+        if minimum_significant_fraction is not None
+        else np.nan
+    )
+    count_threshold = (
+        int(minimum_significant_variant_count)
+        if minimum_significant_variant_count is not None
+        else None
+    )
+    fraction_mask = pd.Series(False, index=focus_df.index)
+    count_mask = pd.Series(False, index=focus_df.index)
+    if minimum_significant_fraction is not None:
+        fraction_mask = focus_df["fraction_variants_significant_positive"] >= fraction_threshold
+    if minimum_significant_variant_count is not None:
+        count_mask = focus_df["n_variants_significant_positive"] >= count_threshold
+
+    if resolved_selection_rule == "fraction_or_count":
+        selected_mask = fraction_mask | count_mask
+    elif resolved_selection_rule == "fraction_and_count":
+        selected_mask = fraction_mask & count_mask
+    elif resolved_selection_rule == "fraction_only":
+        selected_mask = fraction_mask
+    else:
+        selected_mask = count_mask
+
+    focus_df = focus_df.loc[selected_mask].copy()
+    if focus_df.empty:
+        return focus_df
+
+    focus_df = focus_df.sort_values(
+        [
+            "family_id",
+            "fraction_variants_significant_positive",
+            "n_variants_significant_positive",
+            "mean_gain_raw",
+            "pair_label",
+        ],
+        ascending=[True, False, False, False, True],
+    ).reset_index(drop=True)
+    focus_df["focus_rank"] = focus_df.groupby("family_id").cumcount() + 1
+    focus_df = focus_df.loc[
+        focus_df["focus_rank"] <= int(max_pairs_per_family)
+    ].copy()
+    if focus_df.empty:
+        return focus_df
+
+    focus_df["metric_name"] = resolved_metric_name
+    focus_df["color_hex"] = {
+        "hbond_pairs": "#1b9e77",
+        "saltbridge_pairs": "#d95f02",
+    }[resolved_metric_name]
+    focus_df["selection_rule"] = resolved_selection_rule
+    focus_df["minimum_significant_fraction"] = fraction_threshold
+    focus_df["minimum_significant_variant_count"] = (
+        int(count_threshold) if count_threshold is not None else pd.NA
+    )
+    focus_df["residue_spec_a"] = focus_df.apply(
+        lambda row: f"{row['target_model_id']}/{row['target_chain_id']}:{int(row['resid_a'])}",
+        axis=1,
+    )
+    focus_df["residue_spec_b"] = focus_df.apply(
+        lambda row: f"{row['target_model_id']}/{row['target_chain_id']}:{int(row['resid_b'])}",
+        axis=1,
+    )
+    focus_df["pair_residue_spec"] = focus_df.apply(
+        lambda row: (
+            f"{row['target_model_id']}/{row['target_chain_id']}:"
+            f"{int(row['resid_a'])},{int(row['resid_b'])}"
+        ),
+        axis=1,
+    )
+    focus_df["command_slug"] = focus_df.apply(
+        lambda row: (
+            "focus_"
+            + normalize_md_variant_metric_column_name(str(row["metric_name"]))
+            + "_"
+            + normalize_md_variant_metric_column_name(str(row["family_id"]))
+            + f"_pair_{int(row['focus_rank']):02d}_"
+            + normalize_md_variant_metric_column_name(str(row["pair_label"]))[:60]
+        ),
+        axis=1,
+    )
+
+    apply_commands = []
+    open_commands = []
+    metric_label = {
+        "hbond_pairs": "Hydrogen bonds",
+        "saltbridge_pairs": "Salt bridges",
+    }[resolved_metric_name]
+    for row in focus_df.itertuples(index=False):
+        variant_note = str(row.significant_positive_variant_labels).strip()
+        if not variant_note:
+            variant_note = str(row.positive_variant_labels).strip()
+        command_lines = [
+            "# Figure 4 WT ChimeraX gained-interaction focus",
+            f"# Metric: {metric_label}",
+            f"# Family: {row.family_id}",
+            f"# Pair: {row.pair_label}",
+            (
+                "# Selection: significant gain in the family | "
+                f"rule={resolved_selection_rule} | "
+                f"fraction={float(row.fraction_variants_significant_positive):0.3g} | "
+                f"count={int(row.n_variants_significant_positive)}/{int(row.n_variants_tested)} | "
+                f"FDR alpha={float(row.alpha_fdr):0.3g}"
+            ),
+            f"# Significant positive variants: {variant_note if variant_note else 'none listed'}",
+            f"color {row.target_model_id} {neutral_color}",
+            f"show {row.pair_residue_spec} atoms",
+            f"style {row.pair_residue_spec} {resolved_emphasis_style}",
+            f"color {row.pair_residue_spec} {row.color_hex}",
+        ]
+        apply_command = "\n".join(command_lines)
+        open_command_lines = list(command_lines)
+        insert_index = 6
+        if str(target_layout).strip().lower() == "combined_model":
+            if combined_pdb_path is not None:
+                open_command_lines.insert(
+                    insert_index,
+                    f"open {json.dumps(str(Path(combined_pdb_path).resolve()))}",
+                )
+        else:
+            open_command_lines.insert(
+                insert_index,
+                f"open {json.dumps(str(Path(row.aligned_pdb_path).resolve()))}",
+            )
+        apply_commands.append(apply_command)
+        open_commands.append("\n".join(open_command_lines))
+
+    focus_df["apply_command"] = apply_commands
+    focus_df["open_command"] = open_commands
+    return focus_df.sort_values(
+        ["family_id", "focus_rank", "pair_label"]
+    ).reset_index(drop=True)
+
+
 def build_md_variant_analysis_bundle(
     metric_dir: Path,
     mutation_metadata_path: Path,
     metric_window: str | int | None = "latest",
     tm_summary_df: pd.DataFrame | None = None,
+    label_lookup_path: Path | None = None,
 ) -> MDVariantAnalysisBundle:
     required_metrics = [
         "rmsf",
@@ -3171,8 +7303,10 @@ def build_md_variant_analysis_bundle(
         required_metrics=required_metrics,
         metric_window=metric_window,
     )
-    metric_window_start, metric_window_stop = parse_md_variant_metric_window_suffix(
-        metric_window_suffix
+    metric_window_start, metric_window_stop = resolve_md_variant_metric_window_bounds(
+        metric_dir=metric_dir,
+        metric_names=required_metrics,
+        metric_window_suffix=metric_window_suffix,
     )
 
     metadata_df = load_md_variant_metadata(
@@ -3182,6 +7316,16 @@ def build_md_variant_analysis_bundle(
         metadata_df=metadata_df,
         tm_summary_df=tm_summary_df,
     )
+    resolved_label_lookup_path = (
+        label_lookup_path
+        if label_lookup_path is not None
+        else mutation_metadata_path.parent / "md_variant_label_lookup.csv"
+    )
+    if resolved_label_lookup_path.exists():
+        metadata_df = annotate_md_variant_metadata_with_label_lookup(
+            metadata_df=metadata_df,
+            label_lookup_df=load_md_variant_label_lookup(resolved_label_lookup_path),
+        )
     family_ids = order_md_variant_families(metadata_df)
 
     rmsf_raw_df = read_md_variant_metric_table(
@@ -3315,6 +7459,42 @@ def build_md_variant_analysis_bundle(
         metric_name: aggregate_md_variant_pair_metric(
             metric_df,
             replicate_count_by_system=replicate_count_by_system,
+            )
+        for metric_name, metric_df in pair_raw_by_metric.items()
+    }
+    pair_replicate_by_metric = {
+        metric_name: compute_md_variant_pair_replicate_table(metric_df).merge(
+            metadata_df[
+                [
+                    "system",
+                    "family",
+                    "is_wildtype",
+                    "mutation_count",
+                    "short_label",
+                    "tm_display_label",
+                ]
+            ],
+            on="system",
+            how="left",
+            validate="many_to_one",
+        )
+        for metric_name, metric_df in pair_raw_by_metric.items()
+    }
+    pair_residue_replicate_by_metric = {
+        metric_name: compute_md_variant_pair_residue_replicate_table(metric_df).merge(
+            metadata_df[
+                [
+                    "system",
+                    "family",
+                    "is_wildtype",
+                    "mutation_count",
+                    "short_label",
+                    "tm_display_label",
+                ]
+            ],
+            on="system",
+            how="left",
+            validate="many_to_one",
         )
         for metric_name, metric_df in pair_raw_by_metric.items()
     }
@@ -3419,6 +7599,8 @@ def build_md_variant_analysis_bundle(
         interaction_count_replicate_by_metric=interaction_count_replicate_by_metric,
         interaction_count_block_by_metric=interaction_count_block_by_metric,
         global_sasa_replicate_df=global_sasa_replicate_df,
+        pair_replicate_by_metric=pair_replicate_by_metric,
+        pair_residue_replicate_by_metric=pair_residue_replicate_by_metric,
         pair_summary_by_metric=pair_summary_by_metric,
         rmsf_delta_df=rmsf_delta_df,
         sasa_delta_df=sasa_delta_df,
@@ -3600,6 +7782,18 @@ def plot_md_family_delta_heatmap(
     title: str,
     colorbar_label: str,
     vlim: float | None = None,
+    figure_width_mm: float = 381.0,
+    figure_row_height_mm: float = 10.7,
+    figure_base_height_mm: float = 45.7,
+    colorbar_height_mm: float = 28.0,
+    colorbar_width_mm: float = 4.0,
+    colorbar_pad_mm: float = 4.0,
+    y_tick_fontfamily: str = "DejaVu Sans Mono",
+    y_tick_extra_columns: int = 1,
+    show_y_tick_tm_metadata: bool = True,
+    title_size_pt: float = 5.5,
+    label_size_pt: float = 5.5,
+    tick_size_pt: float = 5.5,
 ):
     variant_order = compute_md_variant_order(metadata_df, family_id)
     family_delta_df = delta_df.loc[delta_df["family"].eq(family_id)].copy()
@@ -3622,17 +7816,41 @@ def plot_md_family_delta_heatmap(
         for tick_value in tick_values
         if tick_value in residue_numbers
     ]
-    row_labels = [
-        get_md_variant_display_label(metadata_df, system_name)
-        for system_name in pivot_df.index
-    ]
+    label_getter = (
+        get_md_variant_display_label
+        if show_y_tick_tm_metadata
+        else get_md_variant_base_label
+    )
+    row_labels = [label_getter(metadata_df, system_name) for system_name in pivot_df.index]
+    formatted_row_labels, row_label_columns = format_fixed_width_monospace_labels(
+        row_labels,
+        extra_columns=y_tick_extra_columns,
+    )
     max_abs_value = float(np.nanmax(np.abs(pivot_df.to_numpy(dtype=float))))
     heatmap_limit = vlim if vlim is not None else max(max_abs_value, 1e-6)
-
-    figure, axis = plt.subplots(
-        figsize=(15, max(3.2, 0.42 * len(variant_order) + 1.8)),
-        constrained_layout=True,
+    heatmap_limit = 4
+    figure_width_in, figure_row_height_in, figure_base_height_in = mm_to_inches(
+        figure_width_mm,
+        figure_row_height_mm,
+        figure_base_height_mm,
     )
+    figure_height_in = figure_row_height_in * len(variant_order) + figure_base_height_in
+    colorbar_width_in, colorbar_height_in, colorbar_pad_in = mm_to_inches(
+        colorbar_width_mm,
+        colorbar_height_mm,
+        colorbar_pad_mm,
+    )
+    estimated_label_width_in = estimate_monospace_label_width_inches(
+        row_label_columns,
+        tick_size_pt,
+    )
+    left_margin = min(max((estimated_label_width_in + 0.35) / figure_width_in, 0.18), 0.42)
+    right_margin = max(left_margin + 0.20, 1.0 - ((colorbar_width_in + colorbar_pad_in + 0.35) / figure_width_in))
+    figure, axis = plt.subplots(
+        figsize=(figure_width_in, figure_height_in),
+        constrained_layout=False,
+    )
+    figure.subplots_adjust(left=left_margin, right=right_margin, top=0.83, bottom=0.16)
     image = axis.imshow(
         pivot_df.to_numpy(dtype=float),
         aspect="auto",
@@ -3640,12 +7858,17 @@ def plot_md_family_delta_heatmap(
         norm=TwoSlopeNorm(vmin=-heatmap_limit, vcenter=0.0, vmax=heatmap_limit),
     )
     axis.set_yticks(np.arange(len(row_labels)))
-    axis.set_yticklabels(row_labels)
+    axis.set_yticklabels(
+        formatted_row_labels,
+        fontfamily=y_tick_fontfamily,
+        fontsize=tick_size_pt,
+    )
     axis.set_xticks(tick_positions)
-    axis.set_xticklabels(tick_values)
-    axis.set_xlabel("Residue number")
-    axis.set_ylabel("Variant")
-    axis.set_title(title)
+    axis.set_xticklabels(tick_values, fontsize=tick_size_pt)
+    axis.set_xlabel("Residue number", fontsize=label_size_pt)
+    axis.set_ylabel("Variant", fontsize=label_size_pt)
+    axis.set_title(title, fontsize=title_size_pt, pad=10)
+    axis.tick_params(axis="y", pad=6)
 
     for row_index, variant_system in enumerate(variant_order):
         mutation_resids = metadata_df.loc[
@@ -3667,8 +7890,23 @@ def plot_md_family_delta_heatmap(
                 linewidths=0,
             )
 
-    colorbar = figure.colorbar(image, ax=axis, fraction=0.026, pad=0.02)
-    colorbar.set_label(colorbar_label)
+    axis_position = axis.get_position()
+    cbar_height_fraction = min(colorbar_height_in / figure_height_in, axis_position.height)
+    cbar_width_fraction = colorbar_width_in / figure_width_in
+    cbar_pad_fraction = colorbar_pad_in / figure_width_in
+    cbar_x0 = axis_position.x1 + cbar_pad_fraction
+    cbar_y0 = axis_position.y0 + max((axis_position.height - cbar_height_fraction) / 2.0, 0.0)
+    cbar_axis = figure.add_axes(
+        [
+            cbar_x0,
+            cbar_y0,
+            cbar_width_fraction,
+            cbar_height_fraction,
+        ]
+    )
+    colorbar = figure.colorbar(image, cax=cbar_axis)
+    colorbar.set_label(colorbar_label, fontsize=label_size_pt)
+    colorbar.ax.tick_params(labelsize=tick_size_pt)
     return figure
 
 
@@ -3876,7 +8114,9 @@ def plot_md_family_absolute_metric_boxplots(
     system_labels = [
         "WT"
         if system_name == wildtype_system
-        else metadata_df.loc[metadata_df["system"].eq(system_name), "short_label"].iat[0]
+        else get_md_variant_base_label_from_row(
+            metadata_df.loc[metadata_df["system"].eq(system_name)].iloc[0]
+        )
         for system_name in system_order
     ]
 
@@ -3896,21 +8136,21 @@ def plot_md_family_absolute_metric_boxplots(
             MD_VARIANT_INTERACTION_COUNT_LABEL_MAP["residue_contacts"],
             interaction_count_summary_by_metric["residue_contacts"],
             "count_mean",
-            "Relative to WT median",
+            "Replicate-mean count",
         ),
         (
             "hbond_counts",
             MD_VARIANT_INTERACTION_COUNT_LABEL_MAP["hbond_counts"],
             interaction_count_summary_by_metric["hbond_counts"],
             "count_mean",
-            "Relative to WT median",
+            "Replicate-mean count",
         ),
         (
             "saltbridge",
             MD_VARIANT_INTERACTION_COUNT_LABEL_MAP["saltbridge"],
             interaction_count_summary_by_metric["saltbridge"],
             "count_mean",
-            "Relative to WT median",
+            "Replicate-mean count",
         ),
         (
             "global_sasa",
@@ -3919,20 +8159,13 @@ def plot_md_family_absolute_metric_boxplots(
                 global_sasa_replicate_df["family"].eq(family_id)
             ].copy(),
             "global_mean_sasa",
-            "Relative to WT median",
+            "Replicate-mean SASA",
         ),
     ]
 
     for axis_index, (axis, metric_key, title, metric_df, value_column, xlabel) in enumerate(
         (axis, *spec) for axis, spec in zip(axes, plot_specs)
     ):
-        wildtype_values = (
-            metric_df.loc[metric_df["system"].eq(wildtype_system), value_column]
-            .astype(float)
-            .dropna()
-            .to_numpy()
-        )
-        wildtype_median = float(np.median(wildtype_values)) if wildtype_values.size else np.nan
         values_by_system = []
         for system_name in system_order:
             system_values = (
@@ -3941,8 +8174,6 @@ def plot_md_family_absolute_metric_boxplots(
                 .dropna()
                 .to_numpy()
             )
-            if np.isfinite(wildtype_median) and not np.isclose(wildtype_median, 0.0):
-                system_values = system_values / wildtype_median
             if system_values.size == 0:
                 system_values = np.array([np.nan], dtype=float)
             values_by_system.append(system_values)
@@ -3979,7 +8210,6 @@ def plot_md_family_absolute_metric_boxplots(
         axis.set_title(title, fontsize=11)
         axis.set_xlabel(xlabel)
         axis.grid(axis="x", alpha=0.22, linewidth=0.55)
-        axis.axvline(1.0, color="#666666", linewidth=1.0, linestyle="--", alpha=0.8, zorder=0)
 
         metric_significance_df = significance_df.loc[
             significance_df["metric_key"].eq(metric_key)
@@ -3988,30 +8218,40 @@ def plot_md_family_absolute_metric_boxplots(
         if not metric_significance_df.empty:
             x_left, x_right = axis.get_xlim()
             x_span = x_right - x_left
-            annotation_padding = 0.04 * x_span if np.isfinite(x_span) and x_span > 0 else 0.5
-            axis.set_xlim(x_left, x_right + 4.0 * annotation_padding)
+            edge_padding = 0.03 * x_span if np.isfinite(x_span) and x_span > 0 else 0.35
             star_by_system = metric_significance_df.set_index("system")["stars"].to_dict()
-            for position, system_name, system_values in zip(positions, system_order, values_by_system):
+            for box_index, (position, system_name, system_values) in enumerate(
+                zip(positions, system_order, values_by_system)
+            ):
                 stars = star_by_system.get(system_name, "")
                 finite_values = system_values[np.isfinite(system_values)]
                 if not stars or finite_values.size == 0:
                     continue
-                axis.text(
-                    float(np.max(finite_values)) + annotation_padding,
-                    position,
+                whisker_indices = (2 * box_index, 2 * box_index + 1)
+                visible_right_edge = max(
+                    float(np.nanmax(boxplot["whiskers"][whisker_index].get_xdata()))
+                    for whisker_index in whisker_indices
+                )
+                star_anchor_x = min(visible_right_edge, x_right - edge_padding)
+                anchor_at_edge = np.isclose(star_anchor_x, x_right - edge_padding)
+                axis.annotate(
                     stars,
+                    xy=(star_anchor_x, position),
+                    xytext=((-3, 0) if anchor_at_edge else (3, 0)),
+                    textcoords="offset points",
                     va="center",
-                    ha="left",
+                    ha=("right" if anchor_at_edge else "left"),
                     fontsize=12,
                     fontweight="bold",
                     color="#111111",
+                    clip_on=True,
                 )
 
     figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.88))
     figure.suptitle(
-        f"{family_id}: interaction-count and SASA distributions normalized to the WT median\n"
-        "Counts show framewise replicate-mean distributions divided by the WT median; "
-        "SASA shows residue-summed replicate means divided by the WT median. "
+        f"{family_id}: absolute interaction-count and SASA distributions\n"
+        "Counts show framewise replicate-mean distributions in their native units; "
+        "SASA shows residue-summed replicate means in absolute units. "
         "Count stars mark distribution-shift tests on 100-frame block means; "
         "SASA stars mark Welch tests on replicate means, all after BH correction "
         "(* < 0.05, ** < 0.01, *** < 0.001).",
