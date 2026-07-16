@@ -252,11 +252,11 @@ def compute_kabsch_transform(
 
     covariance_matrix = mobile_centered.T @ reference_centered
     left_singular_vectors, _, right_singular_vectors_t = np.linalg.svd(covariance_matrix)
-    rotation_matrix = right_singular_vectors_t.T @ left_singular_vectors.T
+    rotation_matrix = left_singular_vectors @ right_singular_vectors_t
 
     if np.linalg.det(rotation_matrix) < 0:
-        right_singular_vectors_t[-1, :] *= -1
-        rotation_matrix = right_singular_vectors_t.T @ left_singular_vectors.T
+        left_singular_vectors[:, -1] *= -1
+        rotation_matrix = left_singular_vectors @ right_singular_vectors_t
 
     return rotation_matrix, mobile_center, reference_center
 
@@ -6044,7 +6044,8 @@ def _build_wildtype_chimerax_pair_gain_focus_score_table(
     md_variant_bundle: MDVariantAnalysisBundle,
     metric_name: str,
     alpha: float = 0.05,
-) -> pd.DataFrame:
+    return_variant_tests: bool = False,
+) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
     resolved_metric_name = _resolve_wildtype_chimerax_metric_name(metric_name)
     if resolved_metric_name not in {"hbond_pairs", "saltbridge_pairs"}:
         raise KeyError(
@@ -6057,7 +6058,7 @@ def _build_wildtype_chimerax_pair_gain_focus_score_table(
         pd.DataFrame(),
     ).copy()
     if pair_replicate_df.empty:
-        return pd.DataFrame(
+        empty_summary_df = pd.DataFrame(
             columns=[
                 "family_id",
                 "metric_name",
@@ -6088,6 +6089,11 @@ def _build_wildtype_chimerax_pair_gain_focus_score_table(
                 "significant_positive_variant_labels",
             ]
         )
+        return (
+            (empty_summary_df, pd.DataFrame())
+            if return_variant_tests
+            else empty_summary_df
+        )
 
     metric_label_map = {
         "hbond_pairs": "Hydrogen bonds",
@@ -6095,6 +6101,7 @@ def _build_wildtype_chimerax_pair_gain_focus_score_table(
     }
     metadata_df = md_variant_bundle.metadata_df
     family_rows = []
+    all_variant_test_tables = []
 
     for family_id in md_variant_bundle.family_ids:
         family_metadata_df = metadata_df.loc[metadata_df["family"].eq(family_id)].copy()
@@ -6252,6 +6259,7 @@ def _build_wildtype_chimerax_pair_gain_focus_score_table(
             family_test_df["significant_fdr"]
             & family_test_df["direction_vs_wt"].eq("negative")
         )
+        all_variant_test_tables.append(family_test_df.copy())
 
         family_summary_df = (
             family_test_df.groupby(
@@ -6363,8 +6371,14 @@ def _build_wildtype_chimerax_pair_gain_focus_score_table(
         family_rows.append(family_summary_df)
 
     if not family_rows:
-        return pd.DataFrame()
-    return pd.concat(family_rows, ignore_index=True).sort_values(
+        empty_summary_df = pd.DataFrame()
+        empty_test_df = pd.concat(all_variant_test_tables, ignore_index=True) if all_variant_test_tables else pd.DataFrame()
+        return (
+            (empty_summary_df, empty_test_df)
+            if return_variant_tests
+            else empty_summary_df
+        )
+    summary_df = pd.concat(family_rows, ignore_index=True).sort_values(
         [
             "family_id",
             "fraction_variants_significant_positive",
@@ -6374,6 +6388,14 @@ def _build_wildtype_chimerax_pair_gain_focus_score_table(
         ],
         ascending=[True, False, False, False, True],
     ).reset_index(drop=True)
+    if not return_variant_tests:
+        return summary_df
+    variant_test_df = (
+        pd.concat(all_variant_test_tables, ignore_index=True)
+        if all_variant_test_tables
+        else pd.DataFrame()
+    )
+    return summary_df, variant_test_df
 
 
 def _build_wildtype_chimerax_interaction_change_score_table(
@@ -7279,6 +7301,409 @@ def build_wildtype_chimerax_interaction_gain_focus_table(
     focus_df["open_command"] = open_commands
     return focus_df.sort_values(
         ["family_id", "focus_rank", "pair_label"]
+    ).reset_index(drop=True)
+
+
+def _resolve_variant_chimerax_structure_path(
+    structure_root: Path,
+    variant_system: str,
+    metric_name: str,
+) -> Path | None:
+    structure_root = Path(structure_root)
+    if not structure_root.exists():
+        return None
+    exact_candidates = list(structure_root.rglob(f"{variant_system}.pdb"))
+    if exact_candidates:
+        return sorted(exact_candidates, key=lambda path: path.as_posix())[0].resolve()
+    candidates = list(structure_root.rglob(f"{variant_system}_*.pdb"))
+    if not candidates:
+        return None
+    return sorted(
+        candidates,
+        key=lambda path: (
+            str(metric_name) not in path.name,
+            "signed" not in path.name,
+            "validation" in path.as_posix(),
+            len(path.as_posix()),
+            path.as_posix(),
+        ),
+    )[0].resolve()
+
+
+def _read_pdb_residue_heavy_sidechain_atoms(
+    pdb_path: Path,
+    residue_number: int,
+) -> tuple[str, list[tuple[str, np.ndarray]]]:
+    backbone_atom_names = {"N", "CA", "C", "O", "OXT"}
+    chain_id = "A"
+    sidechain_atoms: list[tuple[str, np.ndarray]] = []
+    ca_atom: tuple[str, np.ndarray] | None = None
+    with Path(pdb_path).open() as handle:
+        for line in handle:
+            if not line.startswith(("ATOM  ", "HETATM")):
+                continue
+            try:
+                line_residue_number = int(line[22:26])
+            except ValueError:
+                continue
+            if line_residue_number != int(residue_number):
+                continue
+            atom_name = line[12:16].strip()
+            element = line[76:78].strip().upper() or atom_name[:1].upper()
+            if element == "H":
+                continue
+            atom_xyz = np.asarray(
+                [float(line[30:38]), float(line[38:46]), float(line[46:54])],
+                dtype=float,
+            )
+            chain_id = line[21].strip() or chain_id
+            if atom_name == "CA":
+                ca_atom = (atom_name, atom_xyz)
+            if atom_name not in backbone_atom_names:
+                sidechain_atoms.append((atom_name, atom_xyz))
+    if not sidechain_atoms and ca_atom is not None:
+        sidechain_atoms = [ca_atom]
+    return chain_id, sidechain_atoms
+
+
+def _find_closest_variant_interaction_atoms(
+    pdb_path: Path,
+    residue_number_a: int,
+    residue_number_b: int,
+) -> tuple[str, str, str, float] | None:
+    chain_id_a, atoms_a = _read_pdb_residue_heavy_sidechain_atoms(
+        pdb_path=pdb_path,
+        residue_number=residue_number_a,
+    )
+    chain_id_b, atoms_b = _read_pdb_residue_heavy_sidechain_atoms(
+        pdb_path=pdb_path,
+        residue_number=residue_number_b,
+    )
+    if not atoms_a or not atoms_b:
+        return None
+    atom_name_a, atom_xyz_a, atom_name_b, atom_xyz_b = min(
+        (
+            (name_a, xyz_a, name_b, xyz_b)
+            for name_a, xyz_a in atoms_a
+            for name_b, xyz_b in atoms_b
+        ),
+        key=lambda values: float(np.linalg.norm(values[1] - values[3])),
+    )
+    distance_angstrom = float(np.linalg.norm(atom_xyz_a - atom_xyz_b))
+    chain_id = chain_id_a if chain_id_a == chain_id_b else chain_id_a
+    return chain_id, atom_name_a, atom_name_b, distance_angstrom
+
+
+def build_variant_chimerax_interaction_closeup_table(
+    md_variant_bundle: MDVariantAnalysisBundle,
+    metric_name: str,
+    variant_structure_root: Path,
+    significance_alpha: float = 0.05,
+    minimum_significant_fraction: float | None = 0.5,
+    minimum_significant_variant_count: int | None = 2,
+    selection_rule: str = "fraction_or_count",
+    max_pairs_per_family: int = 2,
+    substituted_interaction_color: str = "#CC79A7",
+    original_interaction_color: str = "#0072B2",
+    neutral_color: str = "#c1c1c1",
+    backbone_transparency_percent: float = 45.0,
+    show_dashed_interaction: bool = True,
+    interaction_line_color: str = "#4d4d4d",
+    interaction_line_dashes: int = 8,
+    interaction_line_radius: float = 0.08,
+    closeup_pad_fraction: float = 0.5,
+    alignment_reference_pdb_path: Path | None = None,
+    aligned_structure_output_dir: Path | None = None,
+    model_id_start: int = 101,
+) -> pd.DataFrame:
+    resolved_metric_name = _resolve_wildtype_chimerax_metric_name(metric_name)
+    if resolved_metric_name not in {"hbond_pairs", "saltbridge_pairs"}:
+        raise KeyError(
+            "Variant ChimeraX interaction close-ups are only supported for "
+            "'hbond_pairs' and 'saltbridge_pairs'."
+        )
+    if not 0.0 <= float(backbone_transparency_percent) <= 100.0:
+        raise ValueError("backbone_transparency_percent must be between 0 and 100.")
+    if int(max_pairs_per_family) <= 0:
+        raise ValueError("max_pairs_per_family must be positive.")
+
+    summary_df, variant_test_df = _build_wildtype_chimerax_pair_gain_focus_score_table(
+        md_variant_bundle=md_variant_bundle,
+        metric_name=resolved_metric_name,
+        alpha=significance_alpha,
+        return_variant_tests=True,
+    )
+    if summary_df.empty or variant_test_df.empty:
+        return pd.DataFrame()
+
+    fraction_mask = pd.Series(False, index=summary_df.index)
+    count_mask = pd.Series(False, index=summary_df.index)
+    if minimum_significant_fraction is not None:
+        fraction_mask = (
+            summary_df["fraction_variants_significant_positive"]
+            >= float(minimum_significant_fraction)
+        )
+    if minimum_significant_variant_count is not None:
+        count_mask = (
+            summary_df["n_variants_significant_positive"]
+            >= int(minimum_significant_variant_count)
+        )
+    resolved_selection_rule = str(selection_rule).strip().lower()
+    selection_masks = {
+        "fraction_or_count": fraction_mask | count_mask,
+        "fraction_and_count": fraction_mask & count_mask,
+        "fraction_only": fraction_mask,
+        "count_only": count_mask,
+    }
+    if resolved_selection_rule not in selection_masks:
+        raise ValueError(
+            "Unsupported selection_rule. Expected 'fraction_or_count', "
+            "'fraction_and_count', 'fraction_only', or 'count_only'."
+        )
+
+    selected_pair_df = summary_df.loc[
+        summary_df["dominant_direction"].eq("positive")
+        & selection_masks[resolved_selection_rule]
+    ].copy()
+    selected_pair_df = selected_pair_df.sort_values(
+        [
+            "family_id",
+            "fraction_variants_significant_positive",
+            "n_variants_significant_positive",
+            "mean_gain_raw",
+            "pair_label",
+        ],
+        ascending=[True, False, False, False, True],
+    )
+    selected_pair_df["pair_family_rank"] = selected_pair_df.groupby("family_id").cumcount() + 1
+    selected_pair_df = selected_pair_df.loc[
+        selected_pair_df["pair_family_rank"] <= int(max_pairs_per_family)
+    ].copy()
+    if selected_pair_df.empty:
+        return pd.DataFrame()
+
+    candidate_df = variant_test_df.loc[variant_test_df["significant_positive"]].merge(
+        selected_pair_df,
+        on=[
+            "family_id",
+            "metric_name",
+            "metric_label",
+            "pair_key",
+            "pair_label",
+            "resid_a",
+            "resname_a",
+            "resid_b",
+            "resname_b",
+        ],
+        how="inner",
+        suffixes=("_variant", "_family"),
+        validate="many_to_one",
+    )
+    if candidate_df.empty:
+        return pd.DataFrame()
+
+    structure_path_cache: dict[str, Path | None] = {}
+    for variant_system in candidate_df["variant_system"].astype(str).unique():
+        structure_path_cache[variant_system] = _resolve_variant_chimerax_structure_path(
+            structure_root=variant_structure_root,
+            variant_system=variant_system,
+            metric_name=resolved_metric_name,
+        )
+    candidate_df["variant_structure_path"] = candidate_df["variant_system"].map(
+        structure_path_cache
+    )
+    candidate_df = candidate_df.loc[candidate_df["variant_structure_path"].notna()].copy()
+    if candidate_df.empty:
+        return pd.DataFrame()
+
+    candidate_df = candidate_df.sort_values(
+        [
+            "family_id",
+            "pair_family_rank",
+            "mean_difference",
+            "variant_mean",
+            "p_value_fdr",
+            "variant_system",
+        ],
+        ascending=[True, True, False, False, True, True],
+    )
+    closeup_df = candidate_df.groupby(
+        ["family_id", "pair_family_rank"],
+        as_index=False,
+        sort=False,
+    ).head(1).copy()
+
+    metadata_lookup_df = md_variant_bundle.metadata_df.set_index("system", drop=False)
+    closeup_rows = []
+    alignment_cache: dict[str, dict[str, object]] = {}
+    reference_trace = (
+        parse_ca_trace(Path(alignment_reference_pdb_path))
+        if alignment_reference_pdb_path is not None
+        else None
+    )
+    if reference_trace is not None and aligned_structure_output_dir is None:
+        raise ValueError(
+            "aligned_structure_output_dir is required when alignment_reference_pdb_path is set."
+        )
+    metric_label = {
+        "hbond_pairs": "Hydrogen bond",
+        "saltbridge_pairs": "Salt bridge",
+    }[resolved_metric_name]
+    for closeup_index, row in enumerate(closeup_df.itertuples(index=False)):
+        metadata_row = metadata_lookup_df.loc[str(row.variant_system)]
+        mutation_resids = set(int(value) for value in metadata_row["mutation_resids_list"])
+        substituted_resids = sorted(
+            {int(row.resid_a), int(row.resid_b)}.intersection(mutation_resids)
+        )
+        original_resids = sorted(
+            {int(row.resid_a), int(row.resid_b)}.difference(mutation_resids)
+        )
+        source_structure_path = Path(row.variant_structure_path)
+        structure_path = source_structure_path
+        alignment_summary = {
+            "alignment_reference_pdb_path": "",
+            "alignment_method": "none",
+            "alignment_aligned_length": pd.NA,
+            "alignment_rmsd_angstrom": np.nan,
+            "alignment_tm_score_to_reference": np.nan,
+        }
+        if reference_trace is not None:
+            variant_system = str(row.variant_system)
+            if variant_system not in alignment_cache:
+                variant_trace = parse_ca_trace(source_structure_path)
+                alignment_result = compute_ca_superposition_alignment(
+                    structure_a_trace=reference_trace,
+                    structure_b_trace=variant_trace,
+                )
+                aligned_output_dir = Path(aligned_structure_output_dir)
+                aligned_path = (
+                    aligned_output_dir
+                    / f"{variant_system}_aligned_to_{Path(alignment_reference_pdb_path).stem}.pdb"
+                )
+                _write_transformed_pdb(
+                    template_pdb_path=source_structure_path,
+                    output_path=aligned_path,
+                    rotation_matrix=np.asarray(alignment_result["rotation_matrix"], dtype=float),
+                    mobile_center=np.asarray(alignment_result["mobile_center"], dtype=float),
+                    reference_center=np.asarray(alignment_result["reference_center"], dtype=float),
+                )
+                alignment_cache[variant_system] = {
+                    "aligned_path": aligned_path.resolve(),
+                    "alignment_reference_pdb_path": str(
+                        Path(alignment_reference_pdb_path).resolve()
+                    ),
+                    "alignment_method": "ca_superposition",
+                    "alignment_aligned_length": int(alignment_result["aligned_length"]),
+                    "alignment_rmsd_angstrom": float(alignment_result["rmsd_angstrom"]),
+                    "alignment_tm_score_to_reference": float(
+                        alignment_result["tm_score_to_structure_a"]
+                    ),
+                }
+            cached_alignment = alignment_cache[variant_system]
+            structure_path = Path(cached_alignment["aligned_path"])
+            alignment_summary = {
+                key: cached_alignment[key]
+                for key in (
+                    "alignment_reference_pdb_path",
+                    "alignment_method",
+                    "alignment_aligned_length",
+                    "alignment_rmsd_angstrom",
+                    "alignment_tm_score_to_reference",
+                )
+            }
+        closest_atoms = _find_closest_variant_interaction_atoms(
+            pdb_path=structure_path,
+            residue_number_a=int(row.resid_a),
+            residue_number_b=int(row.resid_b),
+        )
+        chain_id = closest_atoms[0] if closest_atoms is not None else "A"
+        model_id = f"#{int(model_id_start) + closeup_index}"
+        pair_spec = f"{model_id}/{chain_id}:{int(row.resid_a)},{int(row.resid_b)}"
+        command_lines = [
+            "# Figure 4 statistically enriched variant-interaction close-up",
+            f"# Family: {row.family_id}",
+            f"# Variant: {row.variant_label}",
+            f"# Metric and pair: {metric_label} | {row.pair_label}",
+            (
+                "# Variant vs WT: "
+                f"occupancy={float(row.variant_mean):0.4g} vs {float(row.wildtype_mean):0.4g} | "
+                f"gain={float(row.mean_difference):0.4g} | "
+                f"q={float(row.p_value_fdr):0.3g}"
+            ),
+            (
+                "# Family frequency: "
+                f"{int(row.n_variants_significant_positive)}/{int(row.n_variants_tested)} "
+                f"({float(row.fraction_variants_significant_positive):0.3g}) significant gains"
+            ),
+            "# Dashed connector joins the closest heavy sidechain atoms in this static structure; it is illustrative, not an MD-frame contact measurement.",
+            f"# Common-frame alignment: {alignment_summary['alignment_method']} | model id: {model_id}",
+            f"open {json.dumps(str(structure_path.resolve()))} id {model_id}",
+            f"hide {model_id} atoms",
+            f"cartoon {model_id}",
+            f"color {model_id} {to_hex(neutral_color)} target c",
+            f"transparency {model_id} {float(backbone_transparency_percent):0.3g} target c",
+            f"show {pair_spec} & sidechain atoms",
+            f"style {pair_spec} & sidechain stick",
+        ]
+        if original_resids:
+            original_spec = f"{model_id}/{chain_id}:" + ",".join(map(str, original_resids))
+            command_lines.extend(
+                [
+                    f"color {original_spec} & sidechain {to_hex(original_interaction_color)} target a",
+                    f"transparency {original_spec} & sidechain 0 target a",
+                ]
+            )
+        if substituted_resids:
+            substituted_spec = f"{model_id}/{chain_id}:" + ",".join(map(str, substituted_resids))
+            command_lines.extend(
+                [
+                    f"color {substituted_spec} & sidechain {to_hex(substituted_interaction_color)} target a",
+                    f"transparency {substituted_spec} & sidechain 0 target a",
+                ]
+            )
+
+        interaction_atom_spec_a = ""
+        interaction_atom_spec_b = ""
+        interaction_distance_angstrom = np.nan
+        if bool(show_dashed_interaction) and closest_atoms is not None:
+            _, atom_name_a, atom_name_b, interaction_distance_angstrom = closest_atoms
+            interaction_atom_spec_a = f"{model_id}/{chain_id}:{int(row.resid_a)}@{atom_name_a}"
+            interaction_atom_spec_b = f"{model_id}/{chain_id}:{int(row.resid_b)}@{atom_name_b}"
+            command_lines.append(
+                f"distance {interaction_atom_spec_a} {interaction_atom_spec_b} "
+                f"color {to_hex(interaction_line_color)} dashes {int(interaction_line_dashes)} "
+                f"radius {float(interaction_line_radius):0.3g} symbol false"
+            )
+        command_lines.append(f"view {pair_spec} pad {float(closeup_pad_fraction):0.3g}")
+
+        command_slug = (
+            "variant_focus_"
+            + normalize_md_variant_metric_column_name(resolved_metric_name)
+            + "_"
+            + normalize_md_variant_metric_column_name(str(row.family_id))
+            + f"_pair_{int(row.pair_family_rank):02d}_"
+            + normalize_md_variant_metric_column_name(str(row.variant_system))[:50]
+        )
+        closeup_rows.append(
+            {
+                **row._asdict(),
+                "source_variant_structure_path": source_structure_path.resolve(),
+                "aligned_variant_structure_path": structure_path.resolve(),
+                "target_model_id": model_id,
+                **alignment_summary,
+                "mutation_labels": str(metadata_row.get("mutation_labels", "")),
+                "substituted_interaction_resids": " ".join(map(str, substituted_resids)),
+                "original_interaction_resids": " ".join(map(str, original_resids)),
+                "chain_id": chain_id,
+                "interaction_atom_spec_a": interaction_atom_spec_a,
+                "interaction_atom_spec_b": interaction_atom_spec_b,
+                "static_interaction_distance_angstrom": interaction_distance_angstrom,
+                "command_slug": command_slug,
+                "open_command": "\n".join(command_lines),
+            }
+        )
+    return pd.DataFrame(closeup_rows).sort_values(
+        ["family_id", "pair_family_rank", "metric_name"]
     ).reset_index(drop=True)
 
 
