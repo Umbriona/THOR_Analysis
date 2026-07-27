@@ -12,7 +12,7 @@ from typing import Iterable
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm, to_hex
+from matplotlib.colors import LinearSegmentedColormap, Normalize, TwoSlopeNorm, to_hex
 from scipy.stats import ttest_ind
 from statsmodels.stats.multitest import multipletests
 
@@ -7705,6 +7705,490 @@ def build_variant_chimerax_interaction_closeup_table(
     return pd.DataFrame(closeup_rows).sort_values(
         ["family_id", "pair_family_rank", "metric_name"]
     ).reset_index(drop=True)
+
+
+def _chimerax_saltbridge_terminal_atom(residue_name: str) -> str:
+    """Return one representative charged side-chain atom for schematic links."""
+    return {
+        "ARG": "NH1",
+        "ASP": "OD1",
+        "GLU": "OE1",
+        "HIS": "ND1",
+        "LYS": "NZ",
+    }.get(str(residue_name).strip().upper(), "CA")
+
+
+def build_family_chimerax_recurrent_saltbridge_composite_table(
+    md_variant_bundle: MDVariantAnalysisBundle,
+    wildtype_alignment_df: pd.DataFrame,
+    significance_alpha: float = 0.05,
+    minimum_significant_variant_count: int = 2,
+    minimum_significant_fraction: float | None = None,
+    minimum_mean_occupancy_increase: float | None = None,
+    max_pairs_per_family: int = 4,
+    model_id_start: int = 301,
+    chain_id: str = "A",
+    color_by_origin: bool = True,
+    introduced_color: str = "#D55E00",
+    native_color: str = "#0072B2",
+    neutral_color: str = "#c1c1c1",
+    backbone_transparency_percent: float = 45.0,
+    show_schematic_connectors: bool = True,
+    connector_color: str = "#4d4d4d",
+    connector_dashes: int = 8,
+    connector_radius: float = 0.08,
+) -> pd.DataFrame:
+    """Build one schematic recurrent-salt-bridge ChimeraX scene per family.
+
+    Pair inclusion is always based on an FDR-significant positive variant-vs-WT
+    difference. Optional recurrence and mean-occupancy thresholds can make the
+    display more stringent. Interaction endpoints are classified from the
+    significant supporting variants: substituted endpoints are ``introduced``;
+    unchanged endpoints are ``native``. A pair is ``mixed`` when direct and
+    conformational supporters both occur in the family.
+
+    The returned ChimeraX command uses the aligned family WT as a common
+    schematic backbone and ``swapaa`` for introduced endpoints. It must not be
+    interpreted as a sampled or energy-minimized multi-variant structure.
+    """
+    if int(minimum_significant_variant_count) < 1:
+        raise ValueError("minimum_significant_variant_count must be at least 1.")
+    if minimum_significant_fraction is not None and not 0.0 <= float(minimum_significant_fraction) <= 1.0:
+        raise ValueError("minimum_significant_fraction must be between 0 and 1.")
+    if minimum_mean_occupancy_increase is not None and float(minimum_mean_occupancy_increase) < 0.0:
+        raise ValueError("minimum_mean_occupancy_increase must be non-negative.")
+    if int(max_pairs_per_family) <= 0:
+        raise ValueError("max_pairs_per_family must be positive.")
+    if not 0.0 <= float(backbone_transparency_percent) <= 100.0:
+        raise ValueError("backbone_transparency_percent must be between 0 and 100.")
+
+    summary_df, variant_test_df = _build_wildtype_chimerax_pair_gain_focus_score_table(
+        md_variant_bundle=md_variant_bundle,
+        metric_name="saltbridge_pairs",
+        alpha=significance_alpha,
+        return_variant_tests=True,
+    )
+    if summary_df.empty or variant_test_df.empty:
+        return pd.DataFrame()
+
+    selected_df = summary_df.loc[
+        summary_df["n_variants_significant_positive"].ge(
+            int(minimum_significant_variant_count)
+        )
+    ].copy()
+    if minimum_significant_fraction is not None:
+        selected_df = selected_df.loc[
+            selected_df["fraction_variants_significant_positive"].ge(
+                float(minimum_significant_fraction)
+            )
+        ].copy()
+    if minimum_mean_occupancy_increase is not None:
+        selected_df = selected_df.loc[
+            selected_df["mean_gain_raw"].ge(float(minimum_mean_occupancy_increase))
+        ].copy()
+    if selected_df.empty:
+        return pd.DataFrame()
+
+    significant_df = variant_test_df.loc[
+        variant_test_df["significant_positive"]
+    ].copy()
+    metadata_lookup_df = md_variant_bundle.metadata_df.set_index("system", drop=False)
+    support_rows = []
+    for row in significant_df.itertuples(index=False):
+        metadata_row = metadata_lookup_df.loc[str(row.variant_system)]
+        mutation_resids = {
+            int(value) for value in metadata_row.get("mutation_resids_list", [])
+        }
+        introduced_a = int(row.resid_a) in mutation_resids
+        introduced_b = int(row.resid_b) in mutation_resids
+        support_rows.append(
+            {
+                "family_id": str(row.family_id),
+                "pair_key": str(row.pair_key),
+                "variant_system": str(row.variant_system),
+                "variant_label": str(row.variant_label),
+                "mean_difference": float(row.mean_difference),
+                "p_value_fdr": float(row.p_value_fdr),
+                "introduced_a": introduced_a,
+                "introduced_b": introduced_b,
+                "direct_support": introduced_a or introduced_b,
+                "conformational_support": not (introduced_a or introduced_b),
+            }
+        )
+    support_df = pd.DataFrame(support_rows)
+    if support_df.empty:
+        return pd.DataFrame()
+
+    support_summary_df = (
+        support_df.groupby(["family_id", "pair_key"], as_index=False)
+        .agg(
+            n_direct_supporters=("direct_support", "sum"),
+            n_conformational_supporters=("conformational_support", "sum"),
+            endpoint_a_ever_introduced=("introduced_a", "any"),
+            endpoint_b_ever_introduced=("introduced_b", "any"),
+            mean_significant_occupancy_increase=("mean_difference", "mean"),
+            median_significant_occupancy_increase=("mean_difference", "median"),
+            minimum_significant_occupancy_increase=("mean_difference", "min"),
+            maximum_significant_occupancy_increase=("mean_difference", "max"),
+            direct_supporting_variant_labels=(
+                "variant_label",
+                lambda values: "; ".join(
+                    sorted(
+                        dict.fromkeys(
+                            support_df.loc[
+                                support_df.index.isin(values.index)
+                                & support_df["direct_support"],
+                                "variant_label",
+                            ].astype(str)
+                        )
+                    )
+                ),
+            ),
+        )
+    )
+    conformational_label_map = (
+        support_df.loc[support_df["conformational_support"]]
+        .groupby(["family_id", "pair_key"])["variant_label"]
+        .agg(lambda values: "; ".join(sorted(dict.fromkeys(map(str, values)))))
+        .to_dict()
+    )
+    support_summary_df["conformational_supporting_variant_labels"] = [
+        conformational_label_map.get((row.family_id, row.pair_key), "")
+        for row in support_summary_df.itertuples(index=False)
+    ]
+    selected_df = selected_df.merge(
+        support_summary_df,
+        on=["family_id", "pair_key"],
+        how="left",
+        validate="one_to_one",
+    )
+    selected_df["interaction_origin"] = np.select(
+        [
+            selected_df["n_direct_supporters"].gt(0)
+            & selected_df["n_conformational_supporters"].gt(0),
+            selected_df["n_direct_supporters"].gt(0),
+        ],
+        ["mixed", "directly_introduced"],
+        default="native_conformational",
+    )
+    selected_df = selected_df.sort_values(
+        [
+            "family_id",
+            "fraction_variants_significant_positive",
+            "n_variants_significant_positive",
+            "mean_gain_raw",
+            "pair_label",
+        ],
+        ascending=[True, False, False, False, True],
+    ).reset_index(drop=True)
+
+    alignment_lookup_df = wildtype_alignment_df.set_index("family_id", drop=False)
+    output_rows = []
+    for family_index, (family_id, family_df) in enumerate(
+        selected_df.groupby("family_id", sort=True)
+    ):
+        if family_id not in alignment_lookup_df.index:
+            continue
+        alignment_row = alignment_lookup_df.loc[family_id]
+        if isinstance(alignment_row, pd.DataFrame):
+            alignment_row = alignment_row.iloc[0]
+        aligned_pdb_path = Path(alignment_row["aligned_pdb_path"]).resolve()
+        model_id = f"#{int(model_id_start) + family_index}"
+
+        # Greedily retain the highest-ranked compatible pairs. A schematic
+        # position cannot simultaneously be swapped to two residue identities.
+        chosen_rows = []
+        target_resname_by_resid: dict[int, str] = {}
+        for candidate in family_df.itertuples(index=False):
+            candidate_targets = {}
+            if bool(candidate.endpoint_a_ever_introduced):
+                candidate_targets[int(candidate.resid_a)] = str(candidate.resname_a).upper()
+            if bool(candidate.endpoint_b_ever_introduced):
+                candidate_targets[int(candidate.resid_b)] = str(candidate.resname_b).upper()
+            conflict = any(
+                resid in target_resname_by_resid
+                and target_resname_by_resid[resid] != resname
+                for resid, resname in candidate_targets.items()
+            )
+            if conflict:
+                continue
+            target_resname_by_resid.update(candidate_targets)
+            chosen_rows.append(candidate)
+            if len(chosen_rows) >= int(max_pairs_per_family):
+                break
+        if not chosen_rows:
+            continue
+
+        all_resids = sorted(
+            {
+                int(value)
+                for row in chosen_rows
+                for value in (row.resid_a, row.resid_b)
+            }
+        )
+        introduced_resids = sorted(target_resname_by_resid)
+        native_resids = sorted(set(all_resids).difference(introduced_resids))
+        all_spec = f"{model_id}/{chain_id}:" + ",".join(map(str, all_resids))
+        command_lines = [
+            "# Figure 4 family-level recurrent salt-bridge composite",
+            f"# Family: {family_id}",
+            "# SCHEMATIC COMPOSITE: substitutions come from different variants.",
+            "# This is not a sampled, minimized, or physically realized multi-mutant structure.",
+            f"open {json.dumps(str(aligned_pdb_path))} id {model_id}",
+            f"hide {model_id} atoms",
+            f"cartoon {model_id}",
+            f"color {model_id} {to_hex(neutral_color)} target c",
+            f"transparency {model_id} {float(backbone_transparency_percent):0.3g} target c",
+        ]
+        for resid, resname in sorted(target_resname_by_resid.items()):
+            command_lines.append(
+                f"swapaa {model_id}/{chain_id}:{resid} {resname.lower()}"
+            )
+        command_lines.extend(
+            [
+                f"show {all_spec} & sidechain atoms",
+                f"style {all_spec} & sidechain stick",
+            ]
+        )
+        if bool(color_by_origin) and introduced_resids:
+            introduced_spec = f"{model_id}/{chain_id}:" + ",".join(map(str, introduced_resids))
+            command_lines.append(
+                f"color {introduced_spec} & sidechain {to_hex(introduced_color)} target a"
+            )
+        if bool(color_by_origin) and native_resids:
+            native_spec = f"{model_id}/{chain_id}:" + ",".join(map(str, native_resids))
+            command_lines.append(
+                f"color {native_spec} & sidechain {to_hex(native_color)} target a"
+            )
+        if not bool(color_by_origin):
+            command_lines.append(
+                f"color {all_spec} & sidechain {to_hex(introduced_color)} target a"
+            )
+
+        pair_command_lines = []
+        for pair_rank, row in enumerate(chosen_rows, 1):
+            pair_command_lines.append(
+                "# Pair "
+                f"{pair_rank}: {row.pair_label} | origin={row.interaction_origin} | "
+                f"significant gains={int(row.n_variants_significant_positive)}/"
+                f"{int(row.n_variants_tested)} | mean gain={float(row.mean_gain_raw):0.4g}"
+            )
+            if bool(show_schematic_connectors):
+                atom_a = _chimerax_saltbridge_terminal_atom(row.resname_a)
+                atom_b = _chimerax_saltbridge_terminal_atom(row.resname_b)
+                atom_spec_a = f"{model_id}/{chain_id}:{int(row.resid_a)}@{atom_a}"
+                atom_spec_b = f"{model_id}/{chain_id}:{int(row.resid_b)}@{atom_b}"
+                pair_command_lines.append(
+                    f"distance {atom_spec_a} {atom_spec_b} "
+                    f"color {to_hex(connector_color)} dashes {int(connector_dashes)} "
+                    f"radius {float(connector_radius):0.3g} symbol false"
+                )
+            output_rows.append(
+                {
+                    **row._asdict(),
+                    "composite_pair_rank": pair_rank,
+                    "aligned_pdb_path": aligned_pdb_path,
+                    "target_model_id": model_id,
+                    "target_chain_id": chain_id,
+                    "introduced_resids": " ".join(map(str, introduced_resids)),
+                    "native_resids": " ".join(map(str, native_resids)),
+                    "color_by_origin": bool(color_by_origin),
+                    "minimum_mean_occupancy_increase": (
+                        float(minimum_mean_occupancy_increase)
+                        if minimum_mean_occupancy_increase is not None
+                        else np.nan
+                    ),
+                    "command_slug": (
+                        "recurrent_saltbridge_composite_"
+                        + normalize_md_variant_metric_column_name(str(family_id))
+                    ),
+                }
+            )
+        command_lines.extend(pair_command_lines)
+        command_lines.append(f"view {all_spec} pad 0.25")
+        family_command = "\n".join(command_lines)
+        for output_row in output_rows:
+            if output_row["family_id"] == family_id:
+                output_row["open_command"] = family_command
+
+    if not output_rows:
+        return pd.DataFrame()
+    return pd.DataFrame(output_rows).sort_values(
+        ["family_id", "composite_pair_rank"]
+    ).reset_index(drop=True)
+
+
+def plot_family_recurrent_saltbridge_occupancy_dotplot(
+    recurrent_saltbridge_df: pd.DataFrame,
+    figure_width_mm: float = 190.0,
+    panel_height_mm: float = 38.0,
+    font_size: float = 9.0,
+    minimum_dot_size: float = 55.0,
+    maximum_dot_size: float = 240.0,
+    fraction_cmap: str = "viridis",
+    show_significant_range: bool = True,
+):
+    """Plot FDR-significant recurrent salt-bridge occupancy increases.
+
+    The x coordinate is the mean WT-relative occupancy increase among variants
+    with an FDR-significant gain. Horizontal lines span the minimum to maximum
+    significant gain. Dot size shows the significant-supporter count, color
+    shows its fraction of tested variants, and shape shows interaction origin.
+    """
+    required_columns = {
+        "family_id",
+        "pair_label",
+        "interaction_origin",
+        "n_variants_significant_positive",
+        "n_variants_tested",
+        "fraction_variants_significant_positive",
+        "mean_significant_occupancy_increase",
+        "minimum_significant_occupancy_increase",
+        "maximum_significant_occupancy_increase",
+    }
+    missing_columns = sorted(required_columns.difference(recurrent_saltbridge_df.columns))
+    if missing_columns:
+        raise KeyError(
+            "Recurrent salt-bridge dot plot is missing columns: "
+            + ", ".join(missing_columns)
+        )
+    if recurrent_saltbridge_df.empty:
+        raise ValueError("Cannot plot an empty recurrent salt-bridge table.")
+
+    plot_df = recurrent_saltbridge_df.copy()
+    family_ids = list(dict.fromkeys(plot_df["family_id"].astype(str)))
+    entry_count_by_family = (
+        plot_df.groupby("family_id", sort=False).size().astype(int).to_dict()
+    )
+    panel_height_ratios = [
+        max(int(entry_count_by_family.get(family_id, 1)), 1)
+        for family_id in family_ids
+    ]
+    figure_height_mm = max(float(panel_height_mm) * len(family_ids), 55.0)
+    figure, axes = plt.subplots(
+        len(family_ids),
+        1,
+        figsize=mm_to_inches(float(figure_width_mm), figure_height_mm),
+        sharex=True,
+        squeeze=False,
+        constrained_layout=True,
+        gridspec_kw={"height_ratios": panel_height_ratios},
+    )
+    axes = axes[:, 0]
+
+    count_min = int(plot_df["n_variants_significant_positive"].min())
+    count_max = int(plot_df["n_variants_significant_positive"].max())
+
+    def scale_dot_size(count: int) -> float:
+        if count_max == count_min:
+            return 0.5 * (float(minimum_dot_size) + float(maximum_dot_size))
+        fraction = (float(count) - count_min) / (count_max - count_min)
+        return float(minimum_dot_size) + fraction * (
+            float(maximum_dot_size) - float(minimum_dot_size)
+        )
+
+    fraction_values = plot_df["fraction_variants_significant_positive"].to_numpy(dtype=float)
+    color_norm = Normalize(vmin=0.0, vmax=max(1.0, float(np.nanmax(fraction_values))))
+    color_map = plt.get_cmap(fraction_cmap)
+    origin_markers = {
+        "directly_introduced": "o",
+        "native_conformational": "s",
+        "mixed": "D",
+    }
+
+    for axis, family_id in zip(axes, family_ids):
+        family_df = plot_df.loc[plot_df["family_id"].astype(str).eq(family_id)].copy()
+        family_df = family_df.sort_values(
+            [
+                "fraction_variants_significant_positive",
+                "n_variants_significant_positive",
+                "mean_significant_occupancy_increase",
+            ],
+            ascending=[True, True, True],
+        ).reset_index(drop=True)
+        y_positions = np.arange(len(family_df))
+        for y_position, row in enumerate(family_df.itertuples(index=False)):
+            mean_increase = 100.0 * float(row.mean_significant_occupancy_increase)
+            minimum_increase = 100.0 * float(row.minimum_significant_occupancy_increase)
+            maximum_increase = 100.0 * float(row.maximum_significant_occupancy_increase)
+            if bool(show_significant_range):
+                axis.hlines(
+                    y_position,
+                    minimum_increase,
+                    maximum_increase,
+                    color="#777777",
+                    linewidth=1.2,
+                    zorder=1,
+                )
+            axis.scatter(
+                mean_increase,
+                y_position,
+                s=scale_dot_size(int(row.n_variants_significant_positive)),
+                c=[color_map(color_norm(float(row.fraction_variants_significant_positive)))],
+                marker=origin_markers.get(str(row.interaction_origin), "o"),
+                edgecolor="#222222",
+                linewidth=0.7,
+                zorder=2,
+            )
+            axis.annotate(
+                f"{int(row.n_variants_significant_positive)}/{int(row.n_variants_tested)}",
+                xy=(maximum_increase, y_position),
+                xytext=(5, 0),
+                textcoords="offset points",
+                va="center",
+                ha="left",
+                fontsize=max(float(font_size) - 1.0, 6.0),
+                color="#333333",
+            )
+        axis.set_yticks(y_positions)
+        axis.set_yticklabels(family_df["pair_label"], fontsize=font_size)
+        axis.set_title(str(family_id), loc="left", fontsize=font_size + 1.0, fontweight="bold")
+        axis.axvline(0.0, color="#333333", linewidth=0.8)
+        axis.grid(axis="x", color="#dddddd", linewidth=0.6, alpha=0.8)
+        axis.tick_params(axis="x", labelsize=font_size)
+        axis.spines[["top", "right", "left"]].set_visible(False)
+        axis.tick_params(axis="y", length=0)
+
+    axes[-1].set_xlabel(
+        "Mean occupancy increase among FDR-significant variants (percentage points)",
+        fontsize=font_size,
+    )
+    color_mappable = plt.cm.ScalarMappable(norm=color_norm, cmap=color_map)
+    color_mappable.set_array([])
+    colorbar = figure.colorbar(color_mappable, ax=axes, fraction=0.025, pad=0.025)
+    colorbar.set_label("Fraction of variants with significant increase", fontsize=font_size)
+    colorbar.ax.tick_params(labelsize=max(float(font_size) - 1.0, 6.0))
+
+    origin_handles = [
+        plt.Line2D(
+            [0],
+            [0],
+            marker=marker,
+            linestyle="none",
+            markerfacecolor="#aaaaaa",
+            markeredgecolor="#222222",
+            markersize=6.5,
+            label={
+                "directly_introduced": "Introduced endpoint",
+                "native_conformational": "Native/conformational",
+                "mixed": "Mixed support",
+            }[origin],
+        )
+        for origin, marker in origin_markers.items()
+        if origin in set(plot_df["interaction_origin"].astype(str))
+    ]
+    figure.legend(
+        handles=origin_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.48, 1.0),
+        ncol=max(1, len(origin_handles)),
+        frameon=False,
+        fontsize=font_size,
+    )
+    layout_engine = figure.get_layout_engine()
+    if layout_engine is not None:
+        layout_engine.set(rect=(0.0, 0.0, 1.0, 0.94))
+    return figure
 
 
 def build_md_variant_analysis_bundle(
