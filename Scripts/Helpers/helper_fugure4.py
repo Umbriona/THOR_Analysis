@@ -12,7 +12,7 @@ from typing import Iterable
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib.colors import LinearSegmentedColormap, Normalize, TwoSlopeNorm, to_hex
+from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm, to_hex
 from scipy.stats import ttest_ind
 from statsmodels.stats.multitest import multipletests
 
@@ -8025,7 +8025,7 @@ def plot_family_recurrent_saltbridge_occupancy_dotplot(
     font_size: float = 9.0,
     minimum_dot_size: float = 55.0,
     maximum_dot_size: float = 240.0,
-    fraction_cmap: str = "viridis",
+    family_colors: dict[str, str] | None = None,
     show_significant_range: bool = True,
 ):
     """Plot FDR-significant recurrent salt-bridge occupancy increases.
@@ -8033,7 +8033,7 @@ def plot_family_recurrent_saltbridge_occupancy_dotplot(
     The x coordinate is the mean WT-relative occupancy increase among variants
     with an FDR-significant gain. Horizontal lines span the minimum to maximum
     significant gain. Dot size shows the significant-supporter count, color
-    shows its fraction of tested variants, and shape shows interaction origin.
+    identifies the family, and shape shows interaction origin.
     """
     required_columns = {
         "family_id",
@@ -8057,24 +8057,28 @@ def plot_family_recurrent_saltbridge_occupancy_dotplot(
 
     plot_df = recurrent_saltbridge_df.copy()
     family_ids = list(dict.fromkeys(plot_df["family_id"].astype(str)))
-    entry_count_by_family = (
-        plot_df.groupby("family_id", sort=False).size().astype(int).to_dict()
-    )
-    panel_height_ratios = [
-        max(int(entry_count_by_family.get(family_id, 1)), 1)
-        for family_id in family_ids
-    ]
+    default_family_colors = {
+        "A0A2S1LEZ1": "#DA8B5F",
+        "A0A372IUB3": "#597DBF",
+        "MGYP001421927114": "#76BF71",
+    }
+    resolved_family_colors = {
+        **default_family_colors,
+        **(family_colors or {}),
+    }
+    fallback_colors = plt.get_cmap("tab10").colors
+    family_color_lookup = {
+        family_id: resolved_family_colors.get(
+            family_id,
+            to_hex(fallback_colors[index % len(fallback_colors)]),
+        )
+        for index, family_id in enumerate(family_ids)
+    }
     figure_height_mm = max(float(panel_height_mm) * len(family_ids), 55.0)
-    figure, axes = plt.subplots(
-        len(family_ids),
-        1,
+    figure, axis = plt.subplots(
         figsize=mm_to_inches(float(figure_width_mm), figure_height_mm),
-        sharex=True,
-        squeeze=False,
         constrained_layout=True,
-        gridspec_kw={"height_ratios": panel_height_ratios},
     )
-    axes = axes[:, 0]
 
     count_min = int(plot_df["n_variants_significant_positive"].min())
     count_max = int(plot_df["n_variants_significant_positive"].max())
@@ -8087,78 +8091,104 @@ def plot_family_recurrent_saltbridge_occupancy_dotplot(
             float(maximum_dot_size) - float(minimum_dot_size)
         )
 
-    fraction_values = plot_df["fraction_variants_significant_positive"].to_numpy(dtype=float)
-    color_norm = Normalize(vmin=0.0, vmax=max(1.0, float(np.nanmax(fraction_values))))
-    color_map = plt.get_cmap(fraction_cmap)
     origin_markers = {
         "directly_introduced": "o",
         "native_conformational": "s",
         "mixed": "D",
     }
 
-    for axis, family_id in zip(axes, family_ids):
+    ordered_family_tables = []
+    for family_order, family_id in enumerate(family_ids):
         family_df = plot_df.loc[plot_df["family_id"].astype(str).eq(family_id)].copy()
-        family_df = family_df.sort_values(
-            [
-                "fraction_variants_significant_positive",
-                "n_variants_significant_positive",
-                "mean_significant_occupancy_increase",
-            ],
-            ascending=[True, True, True],
-        ).reset_index(drop=True)
-        y_positions = np.arange(len(family_df))
-        for y_position, row in enumerate(family_df.itertuples(index=False)):
-            mean_increase = 100.0 * float(row.mean_significant_occupancy_increase)
-            minimum_increase = 100.0 * float(row.minimum_significant_occupancy_increase)
-            maximum_increase = 100.0 * float(row.maximum_significant_occupancy_increase)
-            if bool(show_significant_range):
-                axis.hlines(
-                    y_position,
-                    minimum_increase,
-                    maximum_increase,
-                    color="#777777",
-                    linewidth=1.2,
-                    zorder=1,
-                )
-            axis.scatter(
-                mean_increase,
-                y_position,
-                s=scale_dot_size(int(row.n_variants_significant_positive)),
-                c=[color_map(color_norm(float(row.fraction_variants_significant_positive)))],
-                marker=origin_markers.get(str(row.interaction_origin), "o"),
-                edgecolor="#222222",
-                linewidth=0.7,
-                zorder=2,
+        if "composite_pair_rank" in family_df.columns:
+            family_df = family_df.sort_values("composite_pair_rank")
+        else:
+            family_df = family_df.sort_values(
+                [
+                    "fraction_variants_significant_positive",
+                    "n_variants_significant_positive",
+                    "mean_significant_occupancy_increase",
+                ],
+                ascending=[False, False, False],
             )
-            axis.annotate(
-                f"{int(row.n_variants_significant_positive)}/{int(row.n_variants_tested)}",
-                xy=(maximum_increase, y_position),
-                xytext=(5, 0),
-                textcoords="offset points",
-                va="center",
-                ha="left",
-                fontsize=max(float(font_size) - 1.0, 6.0),
-                color="#333333",
-            )
-        axis.set_yticks(y_positions)
-        axis.set_yticklabels(family_df["pair_label"], fontsize=font_size)
-        axis.set_title(str(family_id), loc="left", fontsize=font_size + 1.0, fontweight="bold")
-        axis.axvline(0.0, color="#333333", linewidth=0.8)
-        axis.grid(axis="x", color="#dddddd", linewidth=0.6, alpha=0.8)
-        axis.tick_params(axis="x", labelsize=font_size)
-        axis.spines[["top", "right", "left"]].set_visible(False)
-        axis.tick_params(axis="y", length=0)
+        family_df["family_plot_order"] = family_order
+        ordered_family_tables.append(family_df)
+    plot_df = pd.concat(ordered_family_tables, ignore_index=True)
+    y_positions = np.arange(len(plot_df))
 
-    axes[-1].set_xlabel(
-        "Mean occupancy increase among FDR-significant variants (percentage points)",
+    for y_position, row in enumerate(plot_df.itertuples(index=False)):
+        mean_increase = 100.0 * float(row.mean_significant_occupancy_increase)
+        minimum_increase = 100.0 * float(row.minimum_significant_occupancy_increase)
+        maximum_increase = 100.0 * float(row.maximum_significant_occupancy_increase)
+        if bool(show_significant_range):
+            axis.hlines(
+                y_position,
+                minimum_increase,
+                maximum_increase,
+                color="#777777",
+                linewidth=1.2,
+                zorder=1,
+            )
+        axis.scatter(
+            mean_increase,
+            y_position,
+            s=scale_dot_size(int(row.n_variants_significant_positive)),
+            color=family_color_lookup[str(row.family_id)],
+            marker=origin_markers.get(str(row.interaction_origin), "o"),
+            edgecolor="#222222",
+            linewidth=0.7,
+            zorder=2,
+        )
+        axis.annotate(
+            f"{int(row.n_variants_significant_positive)}/{int(row.n_variants_tested)}",
+            xy=(maximum_increase, y_position),
+            xytext=(5, 0),
+            textcoords="offset points",
+            va="center",
+            ha="left",
+            fontsize=max(float(font_size) - 1.0, 5.0),
+            color="#333333",
+        )
+
+    family_change_positions = np.flatnonzero(
+        plot_df["family_id"].astype(str).to_numpy()[1:]
+        != plot_df["family_id"].astype(str).to_numpy()[:-1]
+    )
+    for change_position in family_change_positions:
+        axis.axhline(
+            float(change_position) + 0.5,
+            color="#dddddd",
+            linewidth=0.7,
+            zorder=0,
+        )
+
+    axis.set_yticks(y_positions)
+    axis.set_yticklabels(plot_df["pair_label"], fontsize=font_size)
+    axis.invert_yaxis()
+    axis.axvline(0.0, color="#333333", linewidth=0.8)
+    axis.grid(axis="x", color="#dddddd", linewidth=0.6, alpha=0.8)
+    axis.tick_params(axis="x", labelsize=font_size)
+    axis.spines[["top", "right", "left"]].set_visible(False)
+    axis.tick_params(axis="y", length=0)
+    axis.set_xlabel(
+        "Mean occupancy increase among FDR-significant variants\n"
+        "(percentage points)",
         fontsize=font_size,
     )
-    color_mappable = plt.cm.ScalarMappable(norm=color_norm, cmap=color_map)
-    color_mappable.set_array([])
-    colorbar = figure.colorbar(color_mappable, ax=axes, fraction=0.025, pad=0.025)
-    colorbar.set_label("Fraction of variants with significant increase", fontsize=font_size)
-    colorbar.ax.tick_params(labelsize=max(float(font_size) - 1.0, 6.0))
 
+    family_handles = [
+        plt.Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="none",
+            markerfacecolor=family_color_lookup[family_id],
+            markeredgecolor="#222222",
+            markersize=6.5,
+            label=family_id,
+        )
+        for family_id in family_ids
+    ]
     origin_handles = [
         plt.Line2D(
             [0],
@@ -8177,17 +8207,23 @@ def plot_family_recurrent_saltbridge_occupancy_dotplot(
         for origin, marker in origin_markers.items()
         if origin in set(plot_df["interaction_origin"].astype(str))
     ]
-    figure.legend(
-        handles=origin_handles,
-        loc="upper center",
-        bbox_to_anchor=(0.48, 1.0),
-        ncol=max(1, len(origin_handles)),
+    family_legend = axis.legend(
+        handles=family_handles,
+        loc="lower left",
+        bbox_to_anchor=(0.0, 1.02),
+        ncol=1,
         frameon=False,
         fontsize=font_size,
     )
-    layout_engine = figure.get_layout_engine()
-    if layout_engine is not None:
-        layout_engine.set(rect=(0.0, 0.0, 1.0, 0.94))
+    axis.add_artist(family_legend)
+    axis.legend(
+        handles=origin_handles,
+        loc="lower right",
+        bbox_to_anchor=(1.0, 1.02),
+        ncol=1,
+        frameon=False,
+        fontsize=font_size,
+    )
     return figure
 
 
